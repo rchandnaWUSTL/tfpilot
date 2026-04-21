@@ -16,13 +16,15 @@ import (
 )
 
 var (
-	bold     = color.New(color.Bold)
-	cyan     = color.New(color.FgCyan)
-	green    = color.New(color.FgGreen)
-	red      = color.New(color.FgRed)
-	yellow   = color.New(color.FgYellow)
-	white    = color.New(color.FgWhite)
-	dimWhite = color.New(color.FgWhite, color.Faint)
+	bold      = color.New(color.Bold)
+	cyan      = color.New(color.FgCyan)
+	green     = color.New(color.FgGreen)
+	red       = color.New(color.FgRed)
+	yellow    = color.New(color.FgYellow)
+	white     = color.New(color.FgWhite)
+	dimWhite  = color.New(color.FgWhite, color.Faint)
+	magenta   = color.New(color.FgMagenta, color.Bold)
+	boldWhite = color.New(color.FgWhite, color.Bold)
 )
 
 type REPL struct {
@@ -183,14 +185,19 @@ func truncateJSON(raw json.RawMessage, maxLen int) string {
 }
 
 func printBanner(cfg *config.Config) {
-	bold.Println(`
-  ████████╗███████╗██████╗ ██████╗  █████╗ ███████╗ ██████╗ ██████╗ ███╗   ███╗
+	fmt.Println()
+	magenta.Println(`  ████████╗███████╗██████╗ ██████╗  █████╗ ███████╗ ██████╗ ██████╗ ███╗   ███╗
   ╚══██╔══╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔═══██╗██╔══██╗████╗ ████║
      ██║   █████╗  ██████╔╝██████╔╝███████║█████╗  ██║   ██║██████╔╝██╔████╔██║
      ██║   ██╔══╝  ██╔══██╗██╔══██╗██╔══██║██╔══╝  ██║   ██║██╔══██╗██║╚██╔╝██║
      ██║   ███████╗██║  ██║██║  ██║██║  ██║██║     ╚██████╔╝██║  ██║██║ ╚═╝ ██║
      ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝`)
-	bold.Println("  DEV")
+	boldWhite.Println(`                              ██████╗ ███████╗██╗   ██╗
+                              ██╔══██╗██╔════╝██║   ██║
+                              ██║  ██║█████╗  ██║   ██║
+                              ██║  ██║██╔══╝  ╚██╗ ██╔╝
+                              ██████╔╝███████╗ ╚████╔╝
+                              ╚═════╝ ╚══════╝  ╚═══╝  `)
 	fmt.Println()
 	dimWhite.Printf("  model: %s  |  mode: readonly  |  type /help for commands\n", cfg.Model)
 	fmt.Println()
