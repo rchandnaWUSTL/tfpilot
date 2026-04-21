@@ -58,3 +58,5 @@
 - Homebrew tap: `brew install hashicorp/tap/terraform-dev`
 - `terraform dev` works as a Terraform CLI subcommand
 - Public README, demo GIF, and docs site
+- GitHub Marketplace listing (requires Copilot auth + Homebrew tap first)
+- List application at: https://github.com/marketplace
