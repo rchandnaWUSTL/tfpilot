@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strings"
 
 	"github.com/fatih/color"
 	"github.com/rchandnaWUSTL/terraform-dev/internal/config"
@@ -52,8 +51,38 @@ func runStartupChecks() error {
 		return fmt.Errorf("✗ ANTHROPIC_API_KEY not found in environment.\n    export ANTHROPIC_API_KEY=your-key")
 	}
 
-	if err := checkHCPTFCredentials(); err != nil {
+	if err := ensureHCPTFCredentials(); err != nil {
 		return err
+	}
+
+	return nil
+}
+
+func ensureHCPTFCredentials() error {
+	if err := checkHCPTFCredentials(); err == nil {
+		return nil
+	}
+
+	// No credentials — run hcptf login inline with inherited stdio.
+	fmt.Println()
+	red.Println("  ✗ No HCP Terraform credentials found.")
+	fmt.Println()
+	fmt.Println("  Launching hcptf login...")
+	fmt.Println()
+
+	login := exec.Command("hcptf", "login")
+	login.Stdin = os.Stdin
+	login.Stdout = os.Stdout
+	login.Stderr = os.Stderr
+	if err := login.Run(); err != nil {
+		return fmt.Errorf("✗ hcptf login failed. Try running it manually:\n    hcptf login")
+	}
+
+	fmt.Println()
+
+	// Re-check after login.
+	if err := checkHCPTFCredentials(); err != nil {
+		return fmt.Errorf("✗ Still no valid credentials after login. Try: hcptf whoami")
 	}
 
 	return nil
@@ -63,22 +92,12 @@ func checkHCPTFCredentials() error {
 	cmd := exec.Command("hcptf", "whoami", "-output=json")
 	out, err := cmd.Output()
 	if err != nil {
-		var exitErr *exec.ExitError
-		msg := "✗ No HCP Terraform credentials found.\n    Run: hcptf login\n    Then try: terraform dev"
-		if e, ok := err.(*exec.ExitError); ok {
-			exitErr = e
-			stderr := strings.TrimSpace(string(exitErr.Stderr))
-			if stderr != "" && !strings.Contains(strings.ToLower(stderr), "credentials") &&
-				!strings.Contains(strings.ToLower(stderr), "unauthorized") {
-				msg = fmt.Sprintf("✗ hcptf whoami failed: %s\n    Run: hcptf login", stderr)
-			}
-		}
-		return fmt.Errorf("%s", msg)
+		return fmt.Errorf("no credentials")
 	}
 
 	var result map[string]any
 	if err := json.Unmarshal(out, &result); err != nil {
-		return fmt.Errorf("✗ hcptf returned unexpected output. Run: hcptf login")
+		return fmt.Errorf("unexpected output from hcptf whoami")
 	}
 
 	return nil
