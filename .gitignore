@@ -6,7 +6,7 @@
 .aiki/.manifest.json
 
 # Build outputs
-terraform-dev
+/terraform-dev
 *.test
 
 # Go workspace
