@@ -15,4 +15,4 @@ terraform-dev
 
 ---
 
-Built on [hcptf](https://github.com/thrashr888/hcptf-cli) by @thrashr888.
+Built on [hcptf](https://github.com/thrashr888/hcptf-cli) by [@thrashr888](https://github.com/thrashr888).
