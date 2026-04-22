@@ -41,14 +41,15 @@
 - Policy check integration in run summaries
 - Empty variable list handled correctly
 
-## v0.5 — Apply Support
-- `--apply` flag unlocks mutation mode
-- Dry-run gate: agent proposes, shows plan summary, waits for explicit yes
-- Structured approval: natural language rationale + confirmation before apply
-- Blast radius check before any apply
-- Before any apply, fetch and display cost estimate: "+$X/mo" based on plan resource additions/changes
-- Surface cost delta in run summaries when plan data is available
-- Full audit trail for all mutations
+## v0.5 — Apply Support (Shipped)
+- --apply flag unlocks mutation mode (readonly is default)
+- 3 new mutating tools: _hcp_tf_run_create, _hcp_tf_run_apply, _hcp_tf_run_discard
+- Synchronous approval gate before every mutation
+- Blast radius check: second "yes" required when plan has destructions > 0
+- Auto-discard on cancel if a run was already created
+- Audit log at ~/.terraform-dev/audit.log for every tool call
+- Cost estimate surfaced in plan summary when available
+- Mutating tools invisible to model in readonly mode
 
 ## v0.6 — Config Generation
 - Natural language → Terraform config
