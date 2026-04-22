@@ -1,12 +1,14 @@
 package repl
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -35,23 +37,29 @@ var (
 	boundaryPink = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(203))             // HashiCorp Boundary #EC585D
 )
 
-var _ = vaultYellow // reserved for future warning paths
-
 type REPL struct {
 	cfg       *config.Config
 	ag        *agent.Agent
 	prov      provider.Provider
 	org       string
 	workspace string
+
+	mu              sync.Mutex
+	lastPlanSummary json.RawMessage
+	lastRunID       string
+	discardedRuns   map[string]bool
+	stdinReader     *bufio.Reader
 }
 
 func New(cfg *config.Config, prov provider.Provider, org, workspace string) *REPL {
 	return &REPL{
-		cfg:       cfg,
-		ag:        agent.New(cfg, prov),
-		prov:      prov,
-		org:       org,
-		workspace: workspace,
+		cfg:           cfg,
+		ag:            agent.New(cfg, prov),
+		prov:          prov,
+		org:           org,
+		workspace:     workspace,
+		discardedRuns: map[string]bool{},
+		stdinReader:   bufio.NewReader(os.Stdin),
 	}
 }
 
@@ -147,7 +155,9 @@ func (r *REPL) ask(userMsg string) {
 				printToolResult(name, result)
 			}
 			sawToolResult.Store(true)
+			r.recordToolResult(name, result)
 		},
+		r.approveMutation,
 	)
 	if err != nil {
 		boundaryPink.Printf("Error: %v\n", err)
@@ -196,6 +206,173 @@ func (r *REPL) ask(userMsg string) {
 		flushLine(buf.String())
 	}
 	fmt.Println()
+}
+
+// recordToolResult captures the last successful plan_summary and run_create
+// payloads so the approval gate can warn on destructive plans and trigger a
+// matching discard when the user cancels an apply.
+func (r *REPL) recordToolResult(name string, result *tools.CallResult) {
+	if result == nil || result.Err != nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch name {
+	case "_hcp_tf_plan_summary":
+		r.lastPlanSummary = result.Output
+	case "_hcp_tf_run_create":
+		if id := extractRunID(result.Output); id != "" {
+			r.lastRunID = id
+		}
+	case "_hcp_tf_run_discard":
+		if id := result.Args["run_id"]; id != "" {
+			r.discardedRuns[id] = true
+		}
+	}
+}
+
+// approveMutation prompts the user before a mutating tool executes. It returns
+// true when the user types "yes". For apply operations on plans with pending
+// destroys, a second confirmation is required. On cancellation of an apply,
+// any previously-created run is discarded synchronously so it does not remain
+// pending in HCP Terraform.
+func (r *REPL) approveMutation(name string, args map[string]string) bool {
+	// Already-discarded runs get an automatic pass on follow-up discard calls
+	// so the agent's "call discard on cancel" rule doesn't double-prompt.
+	if name == "_hcp_tf_run_discard" {
+		r.mu.Lock()
+		discarded := r.discardedRuns[args["run_id"]]
+		r.mu.Unlock()
+		if discarded {
+			return true
+		}
+	}
+
+	action := describeAction(name, args)
+	fmt.Println()
+	vaultYellow.Printf("  ⚠ This will %s. Type 'yes' to confirm or anything else to cancel.\n", action)
+
+	if name == "_hcp_tf_run_apply" {
+		if destroys := r.destroysFromLastPlan(); destroys > 0 {
+			boundaryPink.Printf("  ✗ This plan will destroy %d resource(s). Type 'yes' again to confirm destruction.\n", destroys)
+		}
+	}
+
+	if !r.readYes() {
+		r.onMutationCancelled(name, args)
+		return false
+	}
+
+	if name == "_hcp_tf_run_apply" && r.destroysFromLastPlan() > 0 {
+		boundaryPink.Println("  ✗ Confirm destruction.")
+		if !r.readYes() {
+			r.onMutationCancelled(name, args)
+			return false
+		}
+	}
+
+	return true
+}
+
+func (r *REPL) readYes() bool {
+	fmt.Print("  > ")
+	line, err := r.stdinReader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(line) == "yes"
+}
+
+// onMutationCancelled prints the cancellation marker and, if an apply is being
+// cancelled after a run was created, synchronously discards that run.
+func (r *REPL) onMutationCancelled(name string, args map[string]string) {
+	r.mu.Lock()
+	runID := r.lastRunID
+	alreadyDiscarded := runID != "" && r.discardedRuns[runID]
+	r.mu.Unlock()
+
+	if name == "_hcp_tf_run_apply" && runID != "" && !alreadyDiscarded {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+		defer cancel()
+		discard := tools.Call(ctx, "_hcp_tf_run_discard", map[string]string{
+			"run_id":  runID,
+			"comment": "cancelled at approval gate",
+		}, r.cfg.TimeoutSeconds)
+		printToolResult("_hcp_tf_run_discard", discard)
+		if discard.Err == nil {
+			r.mu.Lock()
+			r.discardedRuns[runID] = true
+			r.mu.Unlock()
+		}
+	}
+	boundaryPink.Println("  Cancelled.")
+}
+
+func (r *REPL) destroysFromLastPlan() int {
+	r.mu.Lock()
+	raw := r.lastPlanSummary
+	r.mu.Unlock()
+	if len(raw) == 0 {
+		return 0
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return 0
+	}
+	for _, key := range []string{"destroy", "destroys", "resource_destructions", "ResourceDestructions"} {
+		if n, ok := toInt(m[key]); ok {
+			return n
+		}
+	}
+	return 0
+}
+
+func toInt(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case string:
+		var x int
+		if _, err := fmt.Sscanf(n, "%d", &x); err == nil {
+			return x, true
+		}
+	}
+	return 0, false
+}
+
+func extractRunID(raw json.RawMessage) string {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	for _, key := range []string{"ID", "id", "run_id", "RunID"} {
+		if s, ok := m[key].(string); ok && strings.HasPrefix(s, "run-") {
+			return s
+		}
+	}
+	return ""
+}
+
+func describeAction(name string, args map[string]string) string {
+	switch name {
+	case "_hcp_tf_run_create":
+		if ws := args["workspace"]; ws != "" {
+			return fmt.Sprintf("create a new run in %s", ws)
+		}
+		return "create a new run"
+	case "_hcp_tf_run_apply":
+		if ws := args["workspace"]; ws != "" {
+			return fmt.Sprintf("apply the pending run in %s", ws)
+		}
+		return "apply the pending run"
+	case "_hcp_tf_run_discard":
+		return "discard the pending run"
+	}
+	return "perform a mutation"
 }
 
 var spinnerFrames = []string{"|", "/", "-", "\\"}
@@ -343,7 +520,11 @@ func printBanner(cfg *config.Config) {
 	sepWidth := utf8.RuneCountInString(tfRows[0] + devRows[0])
 	dimWhite.Println(strings.Repeat("-", sepWidth))
 	fmt.Println()
-	dimWhite.Printf("  model: %s  |  mode: readonly  |  type /help for commands\n", cfg.Model)
+	mode := "readonly"
+	if !cfg.Readonly {
+		mode = "apply"
+	}
+	dimWhite.Printf("  model: %s  |  mode: %s  |  type /help for commands\n", cfg.Model, mode)
 	fmt.Println()
 }
 

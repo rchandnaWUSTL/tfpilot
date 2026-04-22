@@ -10,10 +10,10 @@ import (
 	"github.com/rchandnaWUSTL/terraform-dev/internal/tools"
 )
 
-const systemPrompt = `You are an AI agent for HCP Terraform. You help infrastructure engineers understand their workspaces, runs, drift, and policies by calling tools and reporting findings in plain prose.
+const systemPromptCore = `You are an AI agent for HCP Terraform. You help infrastructure engineers understand their workspaces, runs, drift, and policies by calling tools and reporting findings in plain prose.
 
 Core rules:
-- READ-ONLY mode. Never trigger a run, apply, plan, or mutation.
+%s
 - Call at most 4 tools per response.
 - Never hallucinate resource, run, or workspace names. Only state facts from tool output. If a tool errors, explain plainly.
 - Write plain prose only. No markdown, no headers, no bullet lists, no tables, no bold, no backticks. Plain sentences only.
@@ -60,6 +60,27 @@ Manages 12 resources across AWS (EC2, RDS, ALB). Last applied 2 hours ago with n
 
 No action needed.`
 
+const modeRulesReadonly = `- READ-ONLY mode. Never trigger a run, apply, plan, or mutation.`
+
+const modeRulesApply = `- APPLY mode is enabled. You may propose creating and applying runs.
+- Always call _hcp_tf_plan_summary first to show the user what will change before proposing an apply.
+- Never call _hcp_tf_run_apply without first showing the plan summary and receiving explicit user confirmation through the approval gate.
+- If the plan has destructions > 0, warn the user explicitly before proceeding.
+- Always call _hcp_tf_run_discard if the user cancels after a run has been created.`
+
+func buildSystemPrompt(readonly bool) string {
+	rules := modeRulesApply
+	if readonly {
+		rules = modeRulesReadonly
+	}
+	return fmt.Sprintf(systemPromptCore, rules)
+}
+
+// ApprovalFunc is invoked before a mutating tool executes. Returning false
+// cancels the tool call — the agent will see a user_cancelled error result.
+// The REPL implements this to prompt the user synchronously.
+type ApprovalFunc func(name string, args map[string]string) bool
+
 type StreamChunk struct {
 	Text string
 	Done bool
@@ -87,6 +108,7 @@ func (a *Agent) Ask(
 	org, workspace string,
 	onToolCall func(ToolCallEvent),
 	onToolResult func(name string, result *tools.CallResult),
+	onApproval ApprovalFunc,
 ) (<-chan StreamChunk, error) {
 	msg := userMsg
 	if org != "" || workspace != "" {
@@ -104,7 +126,7 @@ func (a *Agent) Ask(
 		defer close(ch)
 
 		for range 4 {
-			done, err := a.runTurn(ctx, onToolCall, onToolResult, ch)
+			done, err := a.runTurn(ctx, onToolCall, onToolResult, onApproval, ch)
 			if err != nil {
 				ch <- StreamChunk{Err: err}
 				return
@@ -124,13 +146,14 @@ func (a *Agent) runTurn(
 	ctx context.Context,
 	onToolCall func(ToolCallEvent),
 	onToolResult func(name string, result *tools.CallResult),
+	onApproval ApprovalFunc,
 	ch chan<- StreamChunk,
 ) (done bool, err error) {
 	req := provider.SendRequest{
 		Model:        a.cfg.Model,
-		SystemPrompt: systemPrompt,
+		SystemPrompt: buildSystemPrompt(a.cfg.Readonly),
 		Messages:     a.history,
-		Tools:        toolDefinitions(),
+		Tools:        toolDefinitions(a.cfg.Readonly),
 		MaxTokens:    a.cfg.MaxTokens,
 	}
 
@@ -180,7 +203,21 @@ func (a *Agent) runTurn(
 			onToolCall(ToolCallEvent{Name: tu.Name, Args: strArgs})
 		}
 
-		result := tools.Call(ctx, tu.Name, strArgs, a.cfg.TimeoutSeconds)
+		var result *tools.CallResult
+		if tools.IsMutating(tu.Name) && onApproval != nil && !onApproval(tu.Name, strArgs) {
+			result = &tools.CallResult{
+				ToolName: tu.Name,
+				Args:     strArgs,
+				Err: &tools.ToolError{
+					ErrorCode: "user_cancelled",
+					Message:   "user cancelled the operation at the approval gate",
+					Retryable: false,
+				},
+			}
+			tools.LogCancellation(tu.Name, strArgs, result)
+		} else {
+			result = tools.Call(ctx, tu.Name, strArgs, a.cfg.TimeoutSeconds)
+		}
 		if onToolResult != nil {
 			onToolResult(tu.Name, result)
 		}
@@ -216,8 +253,8 @@ func (a *Agent) Reset() {
 	a.history = nil
 }
 
-func toolDefinitions() []provider.ToolDefinition {
-	defs := tools.Definitions()
+func toolDefinitions(readonly bool) []provider.ToolDefinition {
+	defs := tools.DefinitionsFor(readonly)
 	out := make([]provider.ToolDefinition, len(defs))
 	for i, d := range defs {
 		out[i] = provider.ToolDefinition{

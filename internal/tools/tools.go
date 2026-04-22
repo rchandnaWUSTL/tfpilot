@@ -4,12 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 )
+
+// MutatingTools is the set of tool names that cause a state change in HCP
+// Terraform. The REPL approval gate and the readonly-mode filter key off this
+// set.
+var MutatingTools = map[string]bool{
+	"_hcp_tf_run_create":  true,
+	"_hcp_tf_run_apply":   true,
+	"_hcp_tf_run_discard": true,
+}
+
+// IsMutating reports whether a tool name triggers state changes.
+func IsMutating(name string) bool { return MutatingTools[name] }
 
 type ToolError struct {
 	ErrorCode string `json:"error_code"`
@@ -28,6 +42,221 @@ type CallResult struct {
 }
 
 func Call(ctx context.Context, name string, args map[string]string, timeoutSec int) *CallResult {
+	result := callDispatch(ctx, name, args, timeoutSec)
+	writeAuditLog(name, args, result)
+	return result
+}
+
+// LogCancellation records a synthesized tool-call result in the audit log —
+// used when the approval gate rejects a mutation and the tool never actually
+// executes, so there is still a durable record of the attempt.
+func LogCancellation(name string, args map[string]string, result *CallResult) {
+	writeAuditLog(name, args, result)
+}
+
+// planSummaryCall fetches the plan summary and best-effort enriches it with a
+// formatted monthly cost delta extracted from `hcptf run read`. Cost lookup
+// errors never fail the call — the field is simply omitted.
+func planSummaryCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_plan_summary", Args: args}
+
+	planArgs, aerr := planSummary(args)
+	if aerr != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: aerr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	pctx, pcancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer pcancel()
+	planOut, execErr := exec.CommandContext(pctx, "hcptf", planArgs...).Output()
+	if execErr != nil {
+		result.Err = normalizeExecError(execErr, pctx, planOut, timeoutSec)
+		result.Duration = time.Since(start)
+		return result
+	}
+	if looksLikeHTML(string(planOut)) {
+		result.Err = htmlGuardError()
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var planMap map[string]any
+	if err := json.Unmarshal(planOut, &planMap); err != nil {
+		// Passthrough if it's not a JSON object we can merge into.
+		result.Output = json.RawMessage(planOut)
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	// Best-effort cost estimate — never fail on error.
+	if delta, ok := fetchCostDelta(ctx, args["run_id"], timeoutSec); ok {
+		planMap["cost_estimate_monthly_delta"] = delta
+	}
+
+	enriched, mErr := json.Marshal(planMap)
+	if mErr != nil {
+		result.Output = json.RawMessage(planOut)
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(enriched)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// normalizeExecError turns an exec.ExitError into the shared ToolError shape,
+// matching the pattern used throughout callDispatch.
+func normalizeExecError(execErr error, ctx context.Context, stdout []byte, timeoutSec int) *ToolError {
+	retryable := false
+	msg := execErr.Error()
+	stderr := ""
+	if e, ok := execErr.(*exec.ExitError); ok {
+		stderr = strings.TrimSpace(string(e.Stderr))
+		if stderr != "" {
+			msg = stderr
+		}
+		retryable = e.ExitCode() == 1
+	}
+	if ctx.Err() != nil {
+		msg = fmt.Sprintf("tool timed out after %ds", timeoutSec)
+		retryable = true
+	}
+	if looksLikeHTML(string(stdout)) || looksLikeHTML(stderr) {
+		return htmlGuardError()
+	}
+	return &ToolError{ErrorCode: "execution_error", Message: msg, Retryable: retryable}
+}
+
+func fetchCostDelta(ctx context.Context, runID string, timeoutSec int) (string, bool) {
+	if runID == "" {
+		return "", false
+	}
+	rctx, rcancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer rcancel()
+	out, err := exec.CommandContext(rctx, "hcptf", "run", "read", "-id="+runID, "-output=json").Output()
+	if err != nil || looksLikeHTML(string(out)) {
+		return "", false
+	}
+	var runMap map[string]any
+	if jerr := json.Unmarshal(out, &runMap); jerr != nil {
+		return "", false
+	}
+	ce, ok := runMap["cost_estimate"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	raw, ok := ce["delta_monthly_cost"]
+	if !ok {
+		return "", false
+	}
+	var num float64
+	switch v := raw.(type) {
+	case float64:
+		num = v
+	case string:
+		if v == "" {
+			return "", false
+		}
+		if _, serr := fmt.Sscanf(v, "%f", &num); serr != nil {
+			return "", false
+		}
+	default:
+		return "", false
+	}
+	if num >= 0 {
+		return fmt.Sprintf("+$%.2f", num), true
+	}
+	return fmt.Sprintf("-$%.2f", -num), true
+}
+
+// writeAuditLog appends a single JSON line per tool invocation to
+// ~/.terraform-dev/audit.log. Logging failures are reported to stderr and
+// never bubble up — they must not block tool execution.
+func writeAuditLog(name string, args map[string]string, result *CallResult) {
+	path, err := auditLogPath()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "audit log: resolve path: %v\n", err)
+		return
+	}
+
+	status := "success"
+	if result.Err != nil {
+		status = "error"
+	}
+
+	entry := map[string]any{
+		"timestamp": time.Now().UTC().Format(time.RFC3339),
+		"tool":      name,
+		"args":      args,
+		"result":    status,
+		"user":      hcptfWhoAmI(),
+	}
+	if result.Err != nil {
+		entry["error_code"] = result.Err.ErrorCode
+	}
+
+	line, mErr := json.Marshal(entry)
+	if mErr != nil {
+		fmt.Fprintf(os.Stderr, "audit log: marshal: %v\n", mErr)
+		return
+	}
+
+	f, oerr := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if oerr != nil {
+		fmt.Fprintf(os.Stderr, "audit log: open: %v\n", oerr)
+		return
+	}
+	defer f.Close()
+
+	if _, werr := f.Write(append(line, '\n')); werr != nil {
+		fmt.Fprintf(os.Stderr, "audit log: write: %v\n", werr)
+	}
+}
+
+func auditLogPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(home, ".terraform-dev")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, "audit.log"), nil
+}
+
+var (
+	whoAmIOnce sync.Once
+	whoAmIVal  string
+)
+
+func hcptfWhoAmI() string {
+	whoAmIOnce.Do(func() {
+		out, err := exec.Command("hcptf", "whoami", "-output=json").Output()
+		if err != nil {
+			whoAmIVal = "unknown"
+			return
+		}
+		var m map[string]any
+		if json.Unmarshal(out, &m) == nil {
+			for _, key := range []string{"Username", "username", "Email", "email", "Name", "name"} {
+				if s, ok := m[key].(string); ok && s != "" {
+					whoAmIVal = s
+					return
+				}
+			}
+		}
+		whoAmIVal = strings.TrimSpace(string(out))
+		if whoAmIVal == "" {
+			whoAmIVal = "unknown"
+		}
+	})
+	return whoAmIVal
+}
+
+func callDispatch(ctx context.Context, name string, args map[string]string, timeoutSec int) *CallResult {
 	if name == "_hcp_tf_workspace_diff" {
 		return workspaceDiffCall(ctx, args, timeoutSec)
 	}
@@ -36,6 +265,9 @@ func Call(ctx context.Context, name string, args map[string]string, timeoutSec i
 	}
 	if name == "_hcp_tf_variable_diff" {
 		return variableDiffCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_plan_summary" {
+		return planSummaryCall(ctx, args, timeoutSec)
 	}
 
 	start := time.Now()
@@ -119,6 +351,12 @@ func buildArgs(toolName string, args map[string]string) ([]string, error) {
 		return policyCheck(args)
 	case "_hcp_tf_plan_summary":
 		return planSummary(args)
+	case "_hcp_tf_run_create":
+		return runCreate(args)
+	case "_hcp_tf_run_apply":
+		return runApply(args)
+	case "_hcp_tf_run_discard":
+		return runDiscard(args)
 	default:
 		return nil, fmt.Errorf("unknown tool: %s", toolName)
 	}
@@ -172,6 +410,41 @@ func planSummary(args map[string]string) ([]string, error) {
 	return []string{"plan", "read",
 		"-run-id=" + args["run_id"],
 		"-output=json",
+	}, nil
+}
+
+func runCreate(args map[string]string) ([]string, error) {
+	if err := require(args, "org", "workspace"); err != nil {
+		return nil, err
+	}
+	cmd := []string{"run", "create",
+		"-org=" + args["org"],
+		"-workspace=" + args["workspace"],
+	}
+	if msg := args["message"]; msg != "" {
+		cmd = append(cmd, "-message="+msg)
+	}
+	cmd = append(cmd, "-output=json")
+	return cmd, nil
+}
+
+func runApply(args map[string]string) ([]string, error) {
+	if err := require(args, "run_id", "comment"); err != nil {
+		return nil, err
+	}
+	return []string{"run", "apply",
+		"-id=" + args["run_id"],
+		"-comment=" + args["comment"],
+	}, nil
+}
+
+func runDiscard(args map[string]string) ([]string, error) {
+	if err := require(args, "run_id", "comment"); err != nil {
+		return nil, err
+	}
+	return []string{"run", "discard",
+		"-id=" + args["run_id"],
+		"-comment=" + args["comment"],
 	}, nil
 }
 
@@ -796,7 +1069,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_plan_summary",
-			Description: "Returns a summary of a plan: adds/changes/destroys, flagged risks.",
+			Description: "Returns a summary of a plan: adds/changes/destroys, flagged risks, and when available a monthly cost delta.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -805,7 +1078,64 @@ func Definitions() []ToolDef {
 				"required": []string{"run_id"},
 			},
 		},
+		{
+			Name:        "_hcp_tf_run_create",
+			Description: "Creates a new run in a workspace and returns the run_id. This is a mutating operation — only available when --apply is set. The caller is responsible for obtaining explicit user approval before calling this tool.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
+					"message":   map[string]any{"type": "string", "description": "Optional message describing the run"},
+				},
+				"required": []string{"org", "workspace"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_run_apply",
+			Description: "Applies a previously-created run in a workspace. This triggers real infrastructure changes and is the only tool that causes an apply. Only available when --apply is set. The caller is responsible for obtaining explicit user approval and for showing the plan summary before calling this tool.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
+					"run_id":    map[string]any{"type": "string", "description": "Run ID (run-xxx) to apply"},
+					"comment":   map[string]any{"type": "string", "description": "Comment recorded on the apply"},
+				},
+				"required": []string{"org", "workspace", "run_id", "comment"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_run_discard",
+			Description: "Discards a pending run so it cannot be applied. Only available when --apply is set. Use this to cancel a run the user no longer wants to proceed with.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"run_id":  map[string]any{"type": "string", "description": "Run ID (run-xxx) to discard"},
+					"comment": map[string]any{"type": "string", "description": "Comment recorded on the discard"},
+				},
+				"required": []string{"run_id", "comment"},
+			},
+		},
 	}
+}
+
+// DefinitionsFor returns tool definitions filtered for the given mode. When
+// readonly is true the mutating tools are excluded so the model never sees
+// them.
+func DefinitionsFor(readonly bool) []ToolDef {
+	all := Definitions()
+	if !readonly {
+		return all
+	}
+	out := make([]ToolDef, 0, len(all))
+	for _, d := range all {
+		if MutatingTools[d.Name] {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
 }
 
 type ToolDef struct {

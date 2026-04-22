@@ -23,6 +23,7 @@ func main() {
 	org := flag.String("org", "", "HCP Terraform organization")
 	workspace := flag.String("workspace", "", "HCP Terraform workspace")
 	auth := flag.String("auth", "", "Auth backend: '' (default, use model_provider from config) or 'copilot'")
+	apply := flag.Bool("apply", false, "Enable mutation mode (run create/apply/discard). Default is readonly.")
 	flag.Parse()
 
 	if err := runStartupChecks(); err != nil {
@@ -55,6 +56,7 @@ func main() {
 	}
 
 	cfg.Model = providerfactory.ModelFor(cfg, authMode)
+	cfg.Readonly = !*apply
 
 	r := repl.New(cfg, prov, *org, *workspace)
 	if err := r.Run(); err != nil {
