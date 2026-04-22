@@ -34,14 +34,12 @@
 - Getting Started section in README with binary install instructions
 - Copilot token cached at ~/.terraform-dev/copilot.json with auto-refresh on 401
 
-## v0.4 — Richer Data Surface (in progress)
-Done:
-- Multi-workspace diff with real resource addresses (prod vs staging)
-- workspace_describe returns actual resource types and inventory
-
-Remaining:
-- Variable diff across workspaces
-- Policy check results integrated into run summaries
+## v0.4 — Richer Data Surface (Shipped)
+- Multi-workspace diff with real resource addresses
+- workspace_describe returns actual resource types and inventory  
+- Variable diff across workspaces (_hcp_tf_variable_diff)
+- Policy check integration in run summaries
+- Empty variable list handled correctly
 
 ## v0.5 — Apply Support
 - `--apply` flag unlocks mutation mode
