@@ -62,18 +62,16 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Validation runs automatically after file write
 - Clean error codes when terraform or gh is missing from PATH
 
-## v0.7 — Plan Analyzer + Run Diagnostics (Shipped)
-- _hcp_tf_plan_analyze tool with risk scoring heuristics
-- Risk levels: Low / Medium / High / Critical with color coding
-- Blast radius: total resources affected, additions/changes/destructions breakdown
-- Policy pre-check: surfaces failed policies, triggers Critical risk level
+## v0.7 — Plan Analyzer (Shipped)
+- _hcp_tf_plan_analyze tool: risk scoring (Low/Medium/High/Critical), blast radius, policy pre-check
+- Risk-level color coding: teal/yellow/pink/pink-bold
+- Apply gate integration: confirmation requirements scale with risk level
 - /analyze <run-id> slash command for direct plan analysis
-- Apply gate integrated: risk level determines confirmation requirements (single yes / double yes / workspace name)
-- Failed policies always trigger Critical regardless of other factors
-- _hcp_tf_run_diagnose tool reads plan and apply logs for failed runs and categorizes the error (auth / quota / resource_conflict / provider / config / policy / network / unknown)
-- Categorized diagnosis returns affected resources, a trimmed log snippet, and a plain-English suggested fix
-- /diagnose <run-id> slash command renders the diagnosis with the HashiCorp palette
-- Agent auto-calls _hcp_tf_run_diagnose when the user asks why a run failed, and chains _hcp_tf_policy_check when the category is "policy"
+- _hcp_tf_run_diagnose tool: error categorization (auth/quota/resource_conflict/provider/config/policy/network/unknown)
+- /diagnose <run-id> slash command with formatted output and suggested fixes
+- Agent automatically diagnoses failed runs when asked why a run failed
+- Auth errors surface workspace credential check suggestion
+- Policy errors chain _hcp_tf_policy_check automatically
 
 ## v0.8 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root
