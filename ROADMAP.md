@@ -40,7 +40,6 @@ Done:
 - workspace_describe returns actual resource types and inventory
 
 Remaining:
-- Run history with cost delta and resource change breakdown
 - Variable diff across workspaces
 - Policy check results integrated into run summaries
 
@@ -49,6 +48,8 @@ Remaining:
 - Dry-run gate: agent proposes, shows plan summary, waits for explicit yes
 - Structured approval: natural language rationale + confirmation before apply
 - Blast radius check before any apply
+- Before any apply, fetch and display cost estimate: "+$X/mo" based on plan resource additions/changes
+- Surface cost delta in run summaries when plan data is available
 - Full audit trail for all mutations
 
 ## v0.6 — Config Generation
