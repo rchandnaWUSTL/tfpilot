@@ -17,11 +17,11 @@ import (
 	"github.com/rchandnaWUSTL/terraform-dev/internal/tools"
 )
 
-// Conformance test: for each of the 6 tools, we feed each provider a canned
-// response representing the model invoking that tool. Both providers must
-// emit the same neutral StreamEvents. This is what gives us confidence that
-// v0.3 Copilot — which reuses the OpenAI provider — will drive the agent
-// loop identically to Anthropic.
+// Conformance test: for each tool, we feed each provider a canned response
+// representing the model invoking that tool. Both providers must emit the
+// same neutral StreamEvents. This is what gives us confidence that v0.3
+// Copilot — which reuses the OpenAI provider — will drive the agent loop
+// identically to Anthropic.
 
 type toolCase struct {
 	toolName string
@@ -32,6 +32,7 @@ var conformanceCases = []toolCase{
 	{"_hcp_tf_runs_list_recent", map[string]any{"org": "o", "workspace": "w"}},
 	{"_hcp_tf_workspace_diff", map[string]any{"org": "o", "workspace_a": "a", "workspace_b": "b"}},
 	{"_hcp_tf_workspace_describe", map[string]any{"org": "o", "workspace": "w"}},
+	{"_hcp_tf_variable_diff", map[string]any{"org": "o", "workspace_a": "a", "workspace_b": "b"}},
 	{"_hcp_tf_drift_detect", map[string]any{"org": "o", "workspace": "w"}},
 	{"_hcp_tf_policy_check", map[string]any{"run_id": "run-abc"}},
 	{"_hcp_tf_plan_summary", map[string]any{"run_id": "run-abc"}},
@@ -43,7 +44,7 @@ const (
 	postText        = " world"
 )
 
-func TestProviderConformance_AllSixTools(t *testing.T) {
+func TestProviderConformance_AllTools(t *testing.T) {
 	neutralTools := buildNeutralTools()
 
 	for _, tc := range conformanceCases {

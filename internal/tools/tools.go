@@ -34,6 +34,9 @@ func Call(ctx context.Context, name string, args map[string]string, timeoutSec i
 	if name == "_hcp_tf_workspace_describe" {
 		return workspaceDescribeCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_variable_diff" {
+		return variableDiffCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -494,6 +497,222 @@ func fetchWorkspaceRead(ctx context.Context, org, workspace string, timeoutSec i
 	return out, nil
 }
 
+// variableDiffCall fetches variables from two workspaces in parallel and
+// returns a structured key-level diff. Values are never included — sensitive
+// variables only expose the sensitive flag.
+func variableDiffCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_variable_diff", Args: args}
+
+	if err := require(args, "org", "workspace_a", "workspace_b"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	wsA := args["workspace_a"]
+	wsB := args["workspace_b"]
+
+	type fetchResult struct {
+		raw []byte
+		err *ToolError
+	}
+	chA := make(chan fetchResult, 1)
+	chB := make(chan fetchResult, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchVariables(ctx, org, wsA, timeoutSec)
+		if ferr != nil {
+			ferr.Message = "workspace_a: " + ferr.Message
+		}
+		chA <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchVariables(ctx, org, wsB, timeoutSec)
+		if ferr != nil {
+			ferr.Message = "workspace_b: " + ferr.Message
+		}
+		chB <- fetchResult{raw: raw, err: ferr}
+	}()
+	wg.Wait()
+	ra := <-chA
+	rb := <-chB
+
+	if ra.err != nil {
+		result.Err = ra.err
+		result.Duration = time.Since(start)
+		return result
+	}
+	if rb.err != nil {
+		result.Err = rb.err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	varsA, err := parseVariables(ra.raw)
+	if err != nil {
+		result.Err = &ToolError{ErrorCode: "parse_error", Message: "workspace_a: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	varsB, err := parseVariables(rb.raw)
+	if err != nil {
+		result.Err = &ToolError{ErrorCode: "parse_error", Message: "workspace_b: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	mapA := make(map[string]variableEntry, len(varsA))
+	for _, v := range varsA {
+		mapA[v.Key] = v
+	}
+	mapB := make(map[string]variableEntry, len(varsB))
+	for _, v := range varsB {
+		mapB[v.Key] = v
+	}
+
+	onlyInA := []map[string]any{}
+	onlyInB := []map[string]any{}
+	inBoth := []map[string]any{}
+
+	keysA := make([]string, 0, len(mapA))
+	for k := range mapA {
+		keysA = append(keysA, k)
+	}
+	sort.Strings(keysA)
+	for _, k := range keysA {
+		v := mapA[k]
+		if _, ok := mapB[k]; ok {
+			sensitive := v.Sensitive
+			if b, ok := mapB[k]; ok && b.Sensitive {
+				sensitive = true
+			}
+			inBoth = append(inBoth, map[string]any{
+				"key":       v.Key,
+				"sensitive": sensitive,
+			})
+		} else {
+			onlyInA = append(onlyInA, map[string]any{
+				"key":       v.Key,
+				"category":  v.Category,
+				"sensitive": v.Sensitive,
+			})
+		}
+	}
+
+	keysB := make([]string, 0, len(mapB))
+	for k := range mapB {
+		keysB = append(keysB, k)
+	}
+	sort.Strings(keysB)
+	for _, k := range keysB {
+		v := mapB[k]
+		if _, ok := mapA[k]; ok {
+			continue
+		}
+		onlyInB = append(onlyInB, map[string]any{
+			"key":       v.Key,
+			"category":  v.Category,
+			"sensitive": v.Sensitive,
+		})
+	}
+
+	diff := map[string]any{
+		"only_in_a":         onlyInA,
+		"only_in_b":         onlyInB,
+		"in_both":           inBoth,
+		"workspace_a_count": len(varsA),
+		"workspace_b_count": len(varsB),
+	}
+	out, mErr := json.Marshal(diff)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// fetchVariables shells out to `hcptf variable list` and returns the raw JSON
+// array. HTML responses are normalized through the shared guard.
+func fetchVariables(ctx context.Context, org, workspace string, timeoutSec int) ([]byte, *ToolError) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "hcptf", "variable", "list",
+		"-org="+org,
+		"-workspace="+workspace,
+		"-output=json",
+	)
+	out, execErr := cmd.Output()
+	if execErr != nil {
+		retryable := false
+		msg := execErr.Error()
+		stderr := ""
+		if e, ok := execErr.(*exec.ExitError); ok {
+			stderr = strings.TrimSpace(string(e.Stderr))
+			if stderr != "" {
+				msg = stderr
+			}
+			retryable = e.ExitCode() == 1
+		}
+		if ctx.Err() != nil {
+			msg = fmt.Sprintf("tool timed out after %ds", timeoutSec)
+			retryable = true
+		}
+		if looksLikeHTML(string(out)) || looksLikeHTML(stderr) {
+			return nil, htmlGuardError()
+		}
+		return nil, &ToolError{ErrorCode: "execution_error", Message: msg, Retryable: retryable}
+	}
+	if looksLikeHTML(string(out)) {
+		return nil, htmlGuardError()
+	}
+	return out, nil
+}
+
+// variableEntry is the subset of `hcptf variable list` fields the diff needs —
+// Value is intentionally ignored so sensitive values cannot leak into output.
+type variableEntry struct {
+	Key       string
+	Category  string
+	Sensitive bool
+}
+
+// parseVariables unmarshals the hcptf JSON array (where Sensitive comes back as
+// the string "true"/"false") and returns the value-free projection.
+func parseVariables(raw []byte) ([]variableEntry, error) {
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return nil, nil
+	}
+	var items []struct {
+		Key       string `json:"Key"`
+		Category  string `json:"Category"`
+		Sensitive string `json:"Sensitive"`
+	}
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("parse variables: %w", err)
+	}
+	out := make([]variableEntry, 0, len(items))
+	for _, it := range items {
+		if it.Key == "" {
+			continue
+		}
+		out = append(out, variableEntry{
+			Key:       it.Key,
+			Category:  it.Category,
+			Sensitive: strings.EqualFold(strings.TrimSpace(it.Sensitive), "true"),
+		})
+	}
+	return out, nil
+}
+
 // Definitions returns the tool definitions for the Anthropic tool_use API.
 func Definitions() []ToolDef {
 	return []ToolDef{
@@ -533,6 +752,19 @@ func Definitions() []ToolDef {
 					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
 				},
 				"required": []string{"org", "workspace"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_variable_diff",
+			Description: "Compares variables between two HCP Terraform workspaces in the same organization, fetching both in parallel. Returns key-level diff with only_in_a, only_in_b, in_both, and per-workspace counts. Never exposes variable values — sensitive variables are flagged with sensitive:true only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":         map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace_a": map[string]any{"type": "string", "description": "First workspace name"},
+					"workspace_b": map[string]any{"type": "string", "description": "Second workspace name"},
+				},
+				"required": []string{"org", "workspace_a", "workspace_b"},
 			},
 		},
 		{
