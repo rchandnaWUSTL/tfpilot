@@ -49,7 +49,7 @@ type REPL struct {
 	lastPlanSummary json.RawMessage
 	lastRunID       string
 	discardedRuns   map[string]bool
-	stdinReader     *bufio.Reader
+	rl              *readline.Instance
 }
 
 func New(cfg *config.Config, prov provider.Provider, org, workspace string) *REPL {
@@ -60,14 +60,13 @@ func New(cfg *config.Config, prov provider.Provider, org, workspace string) *REP
 		org:           org,
 		workspace:     workspace,
 		discardedRuns: map[string]bool{},
-		stdinReader:   bufio.NewReader(os.Stdin),
 	}
 }
 
-func (r *REPL) Run() error {
-	color.NoColor = false
-	printBanner(r.cfg)
-
+// openReadline builds a fresh readline instance. readYes closes and reopens
+// around the approval prompt so a plain bufio.Scanner read on os.Stdin is not
+// racing readline's internal Terminal goroutine for input bytes.
+func (r *REPL) openReadline() error {
 	rl, err := readline.NewEx(&readline.Config{
 		Prompt:          cyan.Sprint("hcp-tf> "),
 		HistoryFile:     historyPath(),
@@ -77,10 +76,28 @@ func (r *REPL) Run() error {
 	if err != nil {
 		return fmt.Errorf("readline: %w", err)
 	}
-	defer rl.Close()
+	r.rl = rl
+	return nil
+}
+
+func (r *REPL) closeReadline() {
+	if r.rl != nil {
+		_ = r.rl.Close()
+		r.rl = nil
+	}
+}
+
+func (r *REPL) Run() error {
+	color.NoColor = false
+	printBanner(r.cfg)
+
+	if err := r.openReadline(); err != nil {
+		return err
+	}
+	defer r.closeReadline()
 
 	for {
-		line, err := rl.Readline()
+		line, err := r.rl.Readline()
 		if err != nil {
 			break
 		}
@@ -132,6 +149,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		} else {
 			yellow.Println("mode: read-write")
 		}
+	case "/analyze":
+		r.handleAnalyze(parts[1:])
 	default:
 		boundaryPink.Printf("Unknown command: %s\n", parts[0])
 		fmt.Println("Type /help for available commands.")
@@ -237,10 +256,12 @@ func (r *REPL) recordToolResult(name string, result *tools.CallResult) {
 }
 
 // approveMutation prompts the user before a mutating tool executes. It returns
-// true when the user types "yes". For apply operations on plans with pending
-// destroys, a second confirmation is required. On cancellation of an apply,
-// any previously-created run is discarded synchronously so it does not remain
-// pending in HCP Terraform.
+// true when the user types "yes". Apply operations additionally trigger a
+// structured risk assessment via _hcp_tf_plan_analyze; the required
+// confirmation scales with the returned risk_level (Low/Medium → single yes,
+// High → yes twice, Critical → type the workspace name). On cancellation of
+// an apply, any previously-created run is discarded synchronously so it does
+// not remain pending in HCP Terraform.
 func (r *REPL) approveMutation(name string, args map[string]string) bool {
 	// Already-discarded runs get an automatic pass on follow-up discard calls
 	// so the agent's "call discard on cancel" rule doesn't double-prompt.
@@ -253,39 +274,354 @@ func (r *REPL) approveMutation(name string, args map[string]string) bool {
 		}
 	}
 
+	if name == "_hcp_tf_run_apply" {
+		return r.applyGate(args)
+	}
+
 	action := describeAction(name, args)
 	fmt.Println()
 	vaultYellow.Printf("  ⚠ This will %s. Type 'yes' to confirm or anything else to cancel.\n", action)
-
-	if name == "_hcp_tf_run_apply" {
-		if destroys := r.destroysFromLastPlan(); destroys > 0 {
-			boundaryPink.Printf("  ✗ This plan will destroy %d resource(s). Type 'yes' again to confirm destruction.\n", destroys)
-		}
-	}
 
 	if !r.readYes() {
 		r.onMutationCancelled(name, args)
 		return false
 	}
-
-	if name == "_hcp_tf_run_apply" && r.destroysFromLastPlan() > 0 {
-		boundaryPink.Println("  ✗ Confirm destruction.")
-		if !r.readYes() {
-			r.onMutationCancelled(name, args)
-			return false
-		}
-	}
-
 	return true
 }
 
-func (r *REPL) readYes() bool {
-	fmt.Print("  > ")
-	line, err := r.stdinReader.ReadString('\n')
-	if err != nil {
+// applyGate runs _hcp_tf_plan_analyze, renders the risk assessment, and
+// prompts for confirmation with a strength scaled to the returned risk level.
+// When analyze fails, it falls back to the legacy destroys-based gate so the
+// REPL is still safe against network or permission errors on the analyze call.
+func (r *REPL) applyGate(args map[string]string) bool {
+	runID := args["run_id"]
+
+	analyzeArgs := map[string]string{
+		"org":       r.org,
+		"workspace": r.workspace,
+		"run_id":    runID,
+	}
+	actx, acancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer acancel()
+	analyze := tools.Call(actx, "_hcp_tf_plan_analyze", analyzeArgs, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if analyze.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_plan_analyze failed: %s\n", analyze.Err.Message)
+		return r.applyGateLegacy(args)
+	}
+
+	assessment := parseAssessment(analyze.Output)
+	renderAssessment(assessment)
+
+	action := describeAction("_hcp_tf_run_apply", args)
+	switch {
+	case assessment.policyFailed || assessment.riskLevel == "Critical":
+		return r.criticalConfirm(args, action, assessment)
+	case assessment.riskLevel == "High":
+		return r.highConfirm(args, action)
+	default:
+		vaultYellow.Printf("  ⚠ This will %s. Type 'yes' to confirm or anything else to cancel.\n", action)
+		if !r.readYes() {
+			r.onMutationCancelled("_hcp_tf_run_apply", args)
+			return false
+		}
+		return true
+	}
+}
+
+// applyGateLegacy preserves the pre-v0.7 destroys-based gate behavior so that
+// a transient analyze failure does not make apply either impossibly strict or
+// silently permissive.
+func (r *REPL) applyGateLegacy(args map[string]string) bool {
+	action := describeAction("_hcp_tf_run_apply", args)
+	vaultYellow.Printf("  ⚠ This will %s. Type 'yes' to confirm or anything else to cancel.\n", action)
+	if destroys := r.destroysFromLastPlan(); destroys > 0 {
+		boundaryPink.Printf("  ✗ This plan will destroy %d resource(s). Type 'yes' again to confirm destruction.\n", destroys)
+	}
+	if !r.readYes() {
+		r.onMutationCancelled("_hcp_tf_run_apply", args)
 		return false
 	}
-	return strings.TrimSpace(line) == "yes"
+	if r.destroysFromLastPlan() > 0 {
+		boundaryPink.Println("  ✗ Confirm destruction.")
+		if !r.readYes() {
+			r.onMutationCancelled("_hcp_tf_run_apply", args)
+			return false
+		}
+	}
+	return true
+}
+
+// criticalConfirm requires the user to type the exact workspace name — a
+// deliberate mismatch with the usual "yes" keyword so the operator has to
+// acknowledge which workspace they are mutating.
+func (r *REPL) criticalConfirm(args map[string]string, action string, a assessmentResult) bool {
+	boundaryPink.Add(color.Bold).Printf("  ✗ CRITICAL risk. This will %s.\n", action)
+	if len(a.failedPolicies) > 0 {
+		boundaryPink.Printf("  ✗ Failed policies: %s\n", strings.Join(a.failedPolicies, ", "))
+	}
+	boundaryPink.Printf("  ✗ Type the workspace name '%s' to confirm, or anything else to cancel.\n", r.workspace)
+	if r.readLine() != r.workspace {
+		r.onMutationCancelled("_hcp_tf_run_apply", args)
+		return false
+	}
+	return true
+}
+
+// highConfirm requires two independent yes confirmations so the operator
+// cannot fat-finger past a High-risk apply.
+func (r *REPL) highConfirm(args map[string]string, action string) bool {
+	vaultYellow.Printf("  ⚠ HIGH risk. This will %s. Type 'yes' to confirm or anything else to cancel.\n", action)
+	if !r.readYes() {
+		r.onMutationCancelled("_hcp_tf_run_apply", args)
+		return false
+	}
+	boundaryPink.Println("  ✗ Confirm again. Type 'yes' once more to proceed.")
+	if !r.readYes() {
+		r.onMutationCancelled("_hcp_tf_run_apply", args)
+		return false
+	}
+	return true
+}
+
+// readYes suspends readline while prompting, so input goes to this scanner
+// instead of being swallowed by readline's background Terminal goroutine.
+// chzyer/readline v1.5.1 has no Pause/Resume, so we close the instance and
+// reopen it once the user has answered.
+func (r *REPL) readYes() bool {
+	return r.readLine() == "yes"
+}
+
+// readLine captures a single line of input at an approval prompt. Like
+// readYes, it closes readline for the duration of the read so input is not
+// lost to the background Terminal goroutine.
+func (r *REPL) readLine() string {
+	r.closeReadline()
+	defer func() {
+		if err := r.openReadline(); err != nil {
+			boundaryPink.Printf("  ✗ Failed to reopen readline: %v\n", err)
+		}
+	}()
+
+	fmt.Print("  > ")
+	scanner := bufio.NewScanner(os.Stdin)
+	if !scanner.Scan() {
+		return ""
+	}
+	return strings.TrimSpace(scanner.Text())
+}
+
+// handleAnalyze implements /analyze <run-id> by invoking _hcp_tf_plan_analyze
+// with the current org/workspace and rendering the returned assessment. A
+// missing or malformed run-id produces a friendly error instead of panicking.
+func (r *REPL) handleAnalyze(args []string) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		boundaryPink.Println("Usage: /analyze <run-id>")
+		return
+	}
+	runID := strings.TrimSpace(args[0])
+	if !strings.HasPrefix(runID, "run-") {
+		boundaryPink.Printf("Invalid run ID %q — expected a run-xxx identifier.\n", runID)
+		return
+	}
+	if r.org == "" || r.workspace == "" {
+		boundaryPink.Println("Set /org and /workspace before running /analyze.")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_plan_analyze", map[string]string{
+		"org":       r.org,
+		"workspace": r.workspace,
+		"run_id":    runID,
+	}, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_plan_analyze: %s\n", result.Err.Message)
+		return
+	}
+	renderAssessment(parseAssessment(result.Output))
+}
+
+// assessmentResult is the decoded subset of a _hcp_tf_plan_analyze payload the
+// REPL renders and branches on. The raw result is also preserved so /analyze
+// can print the full structure without re-running the tool.
+type assessmentResult struct {
+	runID          string
+	riskLevel      string
+	riskFactors    []assessmentFactor
+	blastRadius    assessmentBlastRadius
+	policyPresent  bool
+	policyTotal    int
+	policyPassed   int
+	policyFailed   bool
+	failedPolicies []string
+	recommendation string
+	reason         string
+}
+
+type assessmentFactor struct {
+	factor    string
+	severity  string
+	resources []string
+}
+
+type assessmentBlastRadius struct {
+	total        int
+	additions    int
+	changes      int
+	destructions int
+	highestRisk  []string
+}
+
+// parseAssessment decodes a _hcp_tf_plan_analyze payload into the subset the
+// REPL renders. Missing fields collapse to zero values rather than erroring so
+// the gate can still fall back to legacy behavior on a partial response.
+func parseAssessment(raw json.RawMessage) assessmentResult {
+	a := assessmentResult{}
+	if len(raw) == 0 {
+		return a
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return a
+	}
+	if s, ok := m["run_id"].(string); ok {
+		a.runID = s
+	}
+	if s, ok := m["risk_level"].(string); ok {
+		a.riskLevel = s
+	}
+	if s, ok := m["recommendation"].(string); ok {
+		a.recommendation = s
+	}
+	if s, ok := m["recommendation_reason"].(string); ok {
+		a.reason = s
+	}
+	if arr, ok := m["risk_factors"].([]any); ok {
+		for _, item := range arr {
+			obj, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			f := assessmentFactor{}
+			if s, ok := obj["factor"].(string); ok {
+				f.factor = s
+			}
+			if s, ok := obj["severity"].(string); ok {
+				f.severity = s
+			}
+			if rs, ok := obj["resources"].([]any); ok {
+				for _, r := range rs {
+					if s, ok := r.(string); ok {
+						f.resources = append(f.resources, s)
+					}
+				}
+			}
+			a.riskFactors = append(a.riskFactors, f)
+		}
+	}
+	if br, ok := m["blast_radius"].(map[string]any); ok {
+		a.blastRadius.total, _ = toInt(br["total_resources_affected"])
+		a.blastRadius.additions, _ = toInt(br["additions"])
+		a.blastRadius.changes, _ = toInt(br["changes"])
+		a.blastRadius.destructions, _ = toInt(br["destructions"])
+		if hr, ok := br["highest_risk_resources"].([]any); ok {
+			for _, r := range hr {
+				if s, ok := r.(string); ok {
+					a.blastRadius.highestRisk = append(a.blastRadius.highestRisk, s)
+				}
+			}
+		}
+	}
+	if pc, ok := m["policy_checks"].(map[string]any); ok {
+		a.policyPresent = true
+		a.policyTotal, _ = toInt(pc["total"])
+		a.policyPassed, _ = toInt(pc["passed"])
+		if failed, _ := toInt(pc["failed"]); failed > 0 {
+			a.policyFailed = true
+		}
+		if fp, ok := pc["failed_policies"].([]any); ok {
+			for _, r := range fp {
+				if s, ok := r.(string); ok {
+					a.failedPolicies = append(a.failedPolicies, s)
+				}
+			}
+		}
+	}
+	return a
+}
+
+// renderAssessment prints the risk level, factors, blast radius, policy
+// results, and recommendation using the HashiCorp palette. Risk level color:
+// Low=waypointTeal, Medium=vaultYellow, High=boundaryPink, Critical=bold pink.
+func renderAssessment(a assessmentResult) {
+	risk := a.riskLevel
+	if risk == "" {
+		risk = "Unknown"
+	}
+	riskUpper := strings.ToUpper(risk)
+
+	var rc *color.Color
+	switch risk {
+	case "Critical":
+		rc = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(203), color.Bold)
+	case "High":
+		rc = boundaryPink
+	case "Medium":
+		rc = vaultYellow
+	case "Low":
+		rc = waypointTeal
+	default:
+		rc = dimWhite
+	}
+	fmt.Print("  ")
+	rc.Printf("Risk Level: %s\n", riskUpper)
+
+	if len(a.riskFactors) > 0 {
+		fmt.Println()
+		white.Println("  Risk Factors:")
+		for _, f := range a.riskFactors {
+			resList := ""
+			if len(f.resources) > 0 {
+				resList = " — " + strings.Join(f.resources, ", ")
+			}
+			white.Printf("    • %s (%s)%s\n", f.factor, f.severity, resList)
+		}
+	}
+
+	fmt.Println()
+	white.Println("  Blast Radius:")
+	white.Printf("    %d resources affected: %d additions, %d changes, %d destructions\n",
+		a.blastRadius.total, a.blastRadius.additions, a.blastRadius.changes, a.blastRadius.destructions)
+	if len(a.blastRadius.highestRisk) > 0 {
+		white.Printf("    Highest risk: %s\n", strings.Join(a.blastRadius.highestRisk, ", "))
+	}
+
+	if a.policyPresent {
+		fmt.Println()
+		white.Printf("  Policy Checks: %d passed / %d failed\n", a.policyPassed, a.policyTotal-a.policyPassed)
+		for _, name := range a.failedPolicies {
+			boundaryPink.Printf("    ✗ %s\n", name)
+		}
+	}
+
+	if a.recommendation != "" || a.reason != "" {
+		fmt.Println()
+		label := a.recommendation
+		if label == "" {
+			label = "unknown"
+		}
+		white.Printf("  Recommendation: %s", label)
+		if a.reason != "" {
+			white.Printf(" — %s", a.reason)
+		}
+		fmt.Println()
+	}
 }
 
 // onMutationCancelled prints the cancellation marker and, if an apply is being
@@ -600,6 +936,7 @@ func printHelp() {
 	fmt.Println("  /org <name>        Set default org")
 	fmt.Println("  /workspace <name>  Set default workspace")
 	fmt.Println("  /mode              Show current mode")
+	fmt.Println("  /analyze <run-id>  Risk assessment for a specific run")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")

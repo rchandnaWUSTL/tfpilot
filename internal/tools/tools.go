@@ -281,6 +281,547 @@ func planSummaryCall(ctx context.Context, args map[string]string, timeoutSec int
 	return result
 }
 
+// planAnalyzeCall fetches plan, run, workspace-resource, and policy-check data
+// for a given run and returns a structured risk assessment. Policy checks are
+// best-effort: when no policies are attached the field is omitted rather than
+// failing the call.
+func planAnalyzeCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_plan_analyze", Args: args}
+
+	if err := require(args, "org", "workspace", "run_id"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	workspace := args["workspace"]
+	runID := args["run_id"]
+
+	type fetchResult struct {
+		raw []byte
+		err *ToolError
+	}
+	chPlan := make(chan fetchResult, 1)
+	chRun := make(chan fetchResult, 1)
+	chRes := make(chan fetchResult, 1)
+	chPol := make(chan fetchResult, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(4)
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "plan", "read", "-run-id="+runID, "-output=json")
+		chPlan <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "run", "read", "-id="+runID, "-output=json")
+		chRun <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchWorkspaceResources(ctx, org, workspace, timeoutSec)
+		chRes <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "policycheck", "list", "-run-id="+runID, "-output=json")
+		chPol <- fetchResult{raw: raw, err: ferr}
+	}()
+	wg.Wait()
+	rPlan := <-chPlan
+	rRun := <-chRun
+	rRes := <-chRes
+	rPol := <-chPol
+
+	if rPlan.err != nil {
+		result.Err = rPlan.err
+		result.Duration = time.Since(start)
+		return result
+	}
+	if rRun.err != nil {
+		result.Err = rRun.err
+		result.Duration = time.Since(start)
+		return result
+	}
+	if rRes.err != nil {
+		result.Err = rRes.err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	plan := decodePlanCounts(rPlan.raw)
+	runResources := decodeRunResources(rRun.raw)
+	inventory, _ := unmarshalResources(rRes.raw)
+
+	policy, policyAvailable := decodePolicyChecks(rPol.raw, rPol.err)
+
+	factors, highestRisk := classifyRiskFactors(runResources, inventory)
+	level := determineRiskLevel(plan, workspace, policy, policyAvailable, factors, runResources, inventory)
+	recommendation, reason := recommendationFor(level, policy, policyAvailable, factors, plan)
+
+	payload := map[string]any{
+		"run_id":       runID,
+		"risk_level":   level,
+		"risk_factors": factors,
+		"blast_radius": map[string]any{
+			"total_resources_affected": plan.additions + plan.changes + plan.destructions,
+			"additions":                plan.additions,
+			"changes":                  plan.changes,
+			"destructions":             plan.destructions,
+			"highest_risk_resources":   highestRisk,
+		},
+		"recommendation":        recommendation,
+		"recommendation_reason": reason,
+	}
+	if policyAvailable {
+		payload["policy_checks"] = map[string]any{
+			"total":           policy.total,
+			"passed":          policy.passed,
+			"failed":          policy.failed,
+			"failed_policies": policy.failedNames,
+		}
+	}
+
+	out, mErr := json.Marshal(payload)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// fetchHCPTFJSON shells out to hcptf with the given args and returns the raw
+// JSON body. Errors are normalized through the shared guard so HTML responses
+// become a 404 ToolError.
+func fetchHCPTFJSON(ctx context.Context, timeoutSec int, hcptfArgs ...string) ([]byte, *ToolError) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "hcptf", hcptfArgs...)
+	out, execErr := cmd.Output()
+	if execErr != nil {
+		return nil, normalizeExecError(execErr, ctx, out, timeoutSec)
+	}
+	if looksLikeHTML(string(out)) {
+		return nil, htmlGuardError()
+	}
+	return out, nil
+}
+
+type planCounts struct {
+	additions    int
+	changes      int
+	destructions int
+}
+
+// decodePlanCounts pulls add/change/destroy counts from `hcptf plan read` JSON.
+// It tolerates a handful of plausible field-name variants so it works across
+// hcptf versions without a brittle single-path lookup.
+func decodePlanCounts(raw []byte) planCounts {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return planCounts{}
+	}
+	return planCounts{
+		additions:    firstIntField(m, "resource_additions", "ResourceAdditions", "additions", "add"),
+		changes:      firstIntField(m, "resource_changes", "ResourceChanges", "changes", "change"),
+		destructions: firstIntField(m, "resource_destructions", "ResourceDestructions", "destructions", "destroy"),
+	}
+}
+
+// decodeRunResources pulls the list of resources-affected-by-the-run from
+// `hcptf run read` JSON. When the field is absent (older hcptf versions),
+// callers fall back to workspace inventory-based classification.
+func decodeRunResources(raw []byte) []runResourceEntry {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil
+	}
+	for _, key := range []string{"resources", "Resources", "resource_changes", "ResourceChanges"} {
+		if arr, ok := m[key].([]any); ok {
+			out := make([]runResourceEntry, 0, len(arr))
+			for _, item := range arr {
+				entry := runResourceEntry{}
+				if obj, ok := item.(map[string]any); ok {
+					entry.address = firstStringField(obj, "address", "Address", "resource_address", "ResourceAddress")
+					entry.resourceType = firstStringField(obj, "type", "Type", "resource_type", "ResourceType")
+					entry.action = strings.ToLower(firstStringField(obj, "action", "Action", "change_action", "ChangeAction"))
+				} else if s, ok := item.(string); ok {
+					entry.address = s
+					entry.resourceType = typeFromAddress(s)
+				}
+				if entry.resourceType == "" {
+					entry.resourceType = typeFromAddress(entry.address)
+				}
+				if entry.address != "" || entry.resourceType != "" {
+					out = append(out, entry)
+				}
+			}
+			if len(out) > 0 {
+				return out
+			}
+		}
+	}
+	return nil
+}
+
+// runResourceEntry is a minimal shape to drive risk classification from either
+// `hcptf run read` resource data or the workspace inventory fallback.
+type runResourceEntry struct {
+	address      string
+	resourceType string
+	action       string
+}
+
+type policyCheckSummary struct {
+	total       int
+	passed      int
+	failed      int
+	failedNames []string
+}
+
+// decodePolicyChecks summarizes policy-check JSON. An empty list means no
+// policies are attached — the caller omits the policy field entirely in that
+// case. A 404 from the HTML guard is also treated as "unavailable" rather than
+// fatal so plan analysis still returns useful data without Sentinel.
+func decodePolicyChecks(raw []byte, ferr *ToolError) (policyCheckSummary, bool) {
+	if ferr != nil {
+		if ferr.ErrorCode == "404" {
+			return policyCheckSummary{}, false
+		}
+		return policyCheckSummary{}, false
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "[]" || trimmed == "null" {
+		return policyCheckSummary{}, false
+	}
+	var arr []map[string]any
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return policyCheckSummary{}, false
+	}
+	if len(arr) == 0 {
+		return policyCheckSummary{}, false
+	}
+	sum := policyCheckSummary{total: len(arr), failedNames: []string{}}
+	for _, item := range arr {
+		status := strings.ToLower(firstStringField(item, "status", "Status", "result", "Result"))
+		name := firstStringField(item, "name", "Name", "policy", "Policy", "policy_name", "PolicyName")
+		if name == "" {
+			name = firstStringField(item, "id", "ID")
+		}
+		failedHere := false
+		switch status {
+		case "passed", "pass", "soft_failed_override", "overridden":
+			sum.passed++
+		case "failed", "fail", "hard_failed", "errored":
+			sum.failed++
+			failedHere = true
+		default:
+			if n, ok := toIntAny(item["failed"]); ok && n > 0 {
+				sum.failed += n
+				failedHere = true
+			}
+			if n, ok := toIntAny(item["passed"]); ok && n > 0 {
+				sum.passed += n
+			}
+		}
+		if failedHere && name != "" {
+			sum.failedNames = append(sum.failedNames, name)
+		}
+	}
+	if sum.total == 0 {
+		return policyCheckSummary{}, false
+	}
+	return sum, true
+}
+
+// classifyRiskFactors groups resources by semantic category (IAM, security
+// group, database, networking, load balancer) so the REPL and agent can
+// surface the specific reasons a plan is risky. Returns the factors plus a
+// "highest risk" resource list drawn from the most severe category that fired.
+func classifyRiskFactors(runResources []runResourceEntry, inventory []workspaceResource) ([]map[string]any, []string) {
+	type group struct {
+		factor    string
+		severity  string
+		resources []string
+	}
+
+	categories := []struct {
+		factor     string
+		severity   string
+		matchType  func(string) bool
+		severityN  int
+	}{
+		{"IAM resource modification", "High", func(t string) bool { return strings.Contains(t, "iam") }, 3},
+		{"Security group change", "High", func(t string) bool { return strings.Contains(t, "security_group") }, 3},
+		{"Database change", "High", func(t string) bool {
+			return strings.Contains(t, "rds") || strings.Contains(t, "database") || strings.Contains(t, "_db") || strings.HasSuffix(t, "db") || strings.HasPrefix(t, "db_") || strings.Contains(t, "dynamodb") || strings.Contains(t, "documentdb")
+		}, 3},
+		{"Networking change", "Medium", func(t string) bool {
+			return strings.Contains(t, "vpc") || strings.Contains(t, "subnet") || strings.Contains(t, "route")
+		}, 2},
+		{"Load balancer change", "Medium", func(t string) bool {
+			return strings.Contains(t, "alb") || strings.Contains(t, "_elb") || strings.HasSuffix(t, "elb") || strings.Contains(t, "_lb") || strings.HasSuffix(t, "_lb") || strings.Contains(t, "lb_")
+		}, 2},
+	}
+
+	// Collect candidate resources: prefer run-level resources; fall back to
+	// workspace inventory when run data doesn't include per-resource detail.
+	candidates := make([]runResourceEntry, 0, len(runResources))
+	if len(runResources) > 0 {
+		candidates = append(candidates, runResources...)
+	} else {
+		for _, r := range inventory {
+			candidates = append(candidates, runResourceEntry{address: r.Address, resourceType: r.Type})
+		}
+	}
+
+	buckets := make(map[string]*group, len(categories))
+	order := make([]string, 0, len(categories))
+	for _, c := range candidates {
+		t := strings.ToLower(c.resourceType)
+		if t == "" {
+			continue
+		}
+		for _, cat := range categories {
+			if !cat.matchType(t) {
+				continue
+			}
+			g, ok := buckets[cat.factor]
+			if !ok {
+				g = &group{factor: cat.factor, severity: cat.severity}
+				buckets[cat.factor] = g
+				order = append(order, cat.factor)
+			}
+			addr := c.address
+			if addr == "" {
+				addr = c.resourceType
+			}
+			if !containsString(g.resources, addr) {
+				g.resources = append(g.resources, addr)
+			}
+			break
+		}
+	}
+
+	factors := make([]map[string]any, 0, len(order))
+	for _, k := range order {
+		g := buckets[k]
+		sort.Strings(g.resources)
+		factors = append(factors, map[string]any{
+			"factor":    g.factor,
+			"severity":  g.severity,
+			"resources": g.resources,
+		})
+	}
+
+	highest := []string{}
+	severityRank := map[string]int{"Critical": 4, "High": 3, "Medium": 2, "Low": 1}
+	bestRank := 0
+	for _, f := range factors {
+		sev := f["severity"].(string)
+		if severityRank[sev] > bestRank {
+			bestRank = severityRank[sev]
+			highest = append([]string(nil), f["resources"].([]string)...)
+		} else if severityRank[sev] == bestRank {
+			highest = append(highest, f["resources"].([]string)...)
+		}
+	}
+	sort.Strings(highest)
+	highest = dedupeStrings(highest)
+	return factors, highest
+}
+
+// determineRiskLevel applies the heuristics in the order given in the v0.7
+// plan — highest wins. Policy failures trump every other signal.
+func determineRiskLevel(plan planCounts, workspace string, policy policyCheckSummary, policyAvailable bool, factors []map[string]any, runResources []runResourceEntry, inventory []workspaceResource) string {
+	if policyAvailable && policy.failed > 0 {
+		return "Critical"
+	}
+	if plan.destructions > 0 && strings.Contains(strings.ToLower(workspace), "prod") {
+		return "Critical"
+	}
+	if plan.destructions > 5 {
+		return "Critical"
+	}
+	if plan.destructions > 0 {
+		return "High"
+	}
+	for _, f := range factors {
+		if f["severity"] == "High" {
+			return "High"
+		}
+	}
+	for _, f := range factors {
+		if f["severity"] == "Medium" {
+			return "Medium"
+		}
+	}
+	if plan.changes > 10 {
+		return "Medium"
+	}
+
+	// Low: only null_resource / random_ resources.
+	candidates := runResources
+	if len(candidates) == 0 {
+		candidates = make([]runResourceEntry, 0, len(inventory))
+		for _, r := range inventory {
+			candidates = append(candidates, runResourceEntry{address: r.Address, resourceType: r.Type})
+		}
+	}
+	if len(candidates) > 0 && allBenignTypes(candidates) {
+		return "Low"
+	}
+	if plan.additions > 0 && plan.changes == 0 && plan.destructions == 0 {
+		return "Low"
+	}
+	return "Low"
+}
+
+func allBenignTypes(entries []runResourceEntry) bool {
+	for _, e := range entries {
+		t := strings.ToLower(e.resourceType)
+		if !strings.HasPrefix(t, "null_resource") && !strings.HasPrefix(t, "random_") {
+			return false
+		}
+	}
+	return true
+}
+
+func recommendationFor(level string, policy policyCheckSummary, policyAvailable bool, factors []map[string]any, plan planCounts) (string, string) {
+	reasons := []string{}
+	if policyAvailable && policy.failed > 0 {
+		if len(policy.failedNames) > 0 {
+			reasons = append(reasons, "Failed policies: "+strings.Join(policy.failedNames, ", "))
+		} else {
+			reasons = append(reasons, fmt.Sprintf("%d policy check(s) failed", policy.failed))
+		}
+	}
+	if plan.destructions > 0 {
+		reasons = append(reasons, fmt.Sprintf("%d destruction(s)", plan.destructions))
+	}
+	if plan.changes > 10 {
+		reasons = append(reasons, fmt.Sprintf("%d in-place changes", plan.changes))
+	}
+	for _, f := range factors {
+		reasons = append(reasons, fmt.Sprintf("%s (%s)", f["factor"], f["severity"]))
+	}
+
+	switch level {
+	case "Critical":
+		msg := "Do not apply — critical risk."
+		if len(reasons) > 0 {
+			msg += " " + strings.Join(reasons, "; ") + "."
+		}
+		return "do_not_apply", msg
+	case "High":
+		msg := "Review carefully before applying — high-risk changes detected."
+		if len(reasons) > 0 {
+			msg += " " + strings.Join(reasons, "; ") + "."
+		}
+		return "review_before_applying", msg
+	case "Medium":
+		msg := "Review the plan before applying."
+		if len(reasons) > 0 {
+			msg += " " + strings.Join(reasons, "; ") + "."
+		}
+		return "review_before_applying", msg
+	default:
+		msg := "Safe to apply — no elevated risk factors detected."
+		if plan.additions+plan.changes+plan.destructions == 0 {
+			msg = "No changes proposed — nothing to apply."
+		}
+		return "safe_to_apply", msg
+	}
+}
+
+func firstIntField(m map[string]any, keys ...string) int {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if n, ok := toIntAny(v); ok {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+func firstStringField(m map[string]any, keys ...string) string {
+	for _, k := range keys {
+		if v, ok := m[k]; ok {
+			if s, ok := v.(string); ok && s != "" {
+				return s
+			}
+		}
+	}
+	return ""
+}
+
+func toIntAny(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), true
+	case int:
+		return n, true
+	case int64:
+		return int(n), true
+	case string:
+		var x int
+		if _, err := fmt.Sscanf(strings.TrimSpace(n), "%d", &x); err == nil {
+			return x, true
+		}
+	}
+	return 0, false
+}
+
+func typeFromAddress(addr string) string {
+	if addr == "" {
+		return ""
+	}
+	// Strip module prefix like `module.foo.`.
+	for strings.HasPrefix(addr, "module.") {
+		parts := strings.SplitN(addr, ".", 3)
+		if len(parts) < 3 {
+			return ""
+		}
+		addr = parts[2]
+	}
+	// "aws_iam_role.app" → "aws_iam_role"
+	if dot := strings.IndexByte(addr, '.'); dot > 0 {
+		return addr[:dot]
+	}
+	return addr
+}
+
+func containsString(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func dedupeStrings(xs []string) []string {
+	if len(xs) == 0 {
+		return xs
+	}
+	out := xs[:0]
+	seen := make(map[string]struct{}, len(xs))
+	for _, x := range xs {
+		if _, ok := seen[x]; ok {
+			continue
+		}
+		seen[x] = struct{}{}
+		out = append(out, x)
+	}
+	return out
+}
+
 // normalizeExecError turns an exec.ExitError into the shared ToolError shape,
 // matching the pattern used throughout callDispatch.
 func normalizeExecError(execErr error, ctx context.Context, stdout []byte, timeoutSec int) *ToolError {
@@ -443,6 +984,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	}
 	if name == "_hcp_tf_plan_summary" {
 		return planSummaryCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_plan_analyze" {
+		return planAnalyzeCall(ctx, args, timeoutSec)
 	}
 	if name == "_hcp_tf_config_validate" {
 		return configValidateCall(ctx, args, timeoutSec)
@@ -1257,6 +1801,19 @@ func Definitions() []ToolDef {
 					"run_id": map[string]any{"type": "string", "description": "Run ID (run-xxx)"},
 				},
 				"required": []string{"run_id"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_plan_analyze",
+			Description: "Produces a structured risk assessment for a run: risk level (Low|Medium|High|Critical), specific risk factors with severity and affected resources, blast radius (adds/changes/destroys plus highest-risk resources), optional policy-check results when policies are attached, and a recommendation (safe_to_apply|review_before_applying|do_not_apply) with plain-English reasoning. Read-only; safe to call in readonly and apply modes.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
+					"run_id":    map[string]any{"type": "string", "description": "Run ID (run-xxx)"},
+				},
+				"required": []string{"org", "workspace", "run_id"},
 			},
 		},
 		{
