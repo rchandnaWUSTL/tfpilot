@@ -31,6 +31,9 @@ func Call(ctx context.Context, name string, args map[string]string, timeoutSec i
 	if name == "_hcp_tf_workspace_diff" {
 		return workspaceDiffCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_workspace_describe" {
+		return workspaceDescribeCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -107,8 +110,6 @@ func buildArgs(toolName string, args map[string]string) ([]string, error) {
 	switch toolName {
 	case "_hcp_tf_runs_list_recent":
 		return runsListRecent(args)
-	case "_hcp_tf_workspace_describe":
-		return workspaceDescribe(args)
 	case "_hcp_tf_drift_detect":
 		return driftDetect(args)
 	case "_hcp_tf_policy_check":
@@ -136,17 +137,6 @@ func runsListRecent(args map[string]string) ([]string, error) {
 	return []string{"run", "list",
 		"-org=" + args["org"],
 		"-workspace=" + args["workspace"],
-		"-output=json",
-	}, nil
-}
-
-func workspaceDescribe(args map[string]string) ([]string, error) {
-	if err := require(args, "org", "workspace"); err != nil {
-		return nil, err
-	}
-	return []string{"workspace", "read",
-		"-org=" + args["org"],
-		"-name=" + args["workspace"],
 		"-output=json",
 	}, nil
 }
@@ -210,7 +200,7 @@ func workspaceDiffCall(ctx context.Context, args map[string]string, timeoutSec i
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		raw, ferr := fetchWorkspaceState(ctx, orgA, wsA, timeoutSec)
+		raw, ferr := fetchWorkspaceResources(ctx, orgA, wsA, timeoutSec)
 		if ferr != nil {
 			ferr.Message = "workspace_a: " + ferr.Message
 		}
@@ -218,7 +208,7 @@ func workspaceDiffCall(ctx context.Context, args map[string]string, timeoutSec i
 	}()
 	go func() {
 		defer wg.Done()
-		raw, ferr := fetchWorkspaceState(ctx, orgB, wsB, timeoutSec)
+		raw, ferr := fetchWorkspaceResources(ctx, orgB, wsB, timeoutSec)
 		if ferr != nil {
 			ferr.Message = "workspace_b: " + ferr.Message
 		}
@@ -298,11 +288,13 @@ func workspaceDiffCall(ctx context.Context, args map[string]string, timeoutSec i
 	return result
 }
 
-func fetchWorkspaceState(ctx context.Context, org, workspace string, timeoutSec int) ([]byte, *ToolError) {
+// fetchWorkspaceResources shells out to `hcptf workspace resource list` and
+// returns the raw JSON array of {Address, ID, Module, Provider, Type} objects.
+func fetchWorkspaceResources(ctx context.Context, org, workspace string, timeoutSec int) ([]byte, *ToolError) {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, "hcptf", "state", "list",
+	cmd := exec.CommandContext(ctx, "hcptf", "workspace", "resource", "list",
 		"-org="+org,
 		"-workspace="+workspace,
 		"-output=json",
@@ -334,106 +326,172 @@ func fetchWorkspaceState(ctx context.Context, org, workspace string, timeoutSec 
 	return out, nil
 }
 
-// parseResourceAddresses extracts resource address strings from an hcptf state
-// list JSON payload. It tolerates a few plausible shapes: a top-level array of
-// objects, a wrapper object with a "resources"/"items"/"state" list, or a raw
-// array of strings.
+// workspaceResource matches the JSON shape of `hcptf workspace resource list`.
+type workspaceResource struct {
+	Address  string `json:"Address"`
+	ID       string `json:"ID"`
+	Module   string `json:"Module"`
+	Provider string `json:"Provider"`
+	Type     string `json:"Type"`
+}
+
+// parseResourceAddresses extracts the Address field from each resource.
 func parseResourceAddresses(raw []byte) ([]string, error) {
-	trimmed := strings.TrimSpace(string(raw))
-	if trimmed == "" {
-		return []string{}, nil
+	items, err := unmarshalResources(raw)
+	if err != nil {
+		return nil, err
 	}
-
-	// Shape 1: []map[string]any
-	var objs []map[string]any
-	if err := json.Unmarshal(raw, &objs); err == nil {
-		return addressesFromObjects(objs), nil
-	}
-
-	// Shape 2: []string
-	var strs []string
-	if err := json.Unmarshal(raw, &strs); err == nil {
-		return strs, nil
-	}
-
-	// Shape 3: wrapper object with a list under a known key
-	var wrapper map[string]any
-	if err := json.Unmarshal(raw, &wrapper); err == nil {
-		for _, key := range []string{"resources", "items", "state", "data"} {
-			v, ok := wrapper[key]
-			if !ok {
-				continue
-			}
-			switch vv := v.(type) {
-			case []any:
-				objs := make([]map[string]any, 0, len(vv))
-				allObj := true
-				for _, el := range vv {
-					if m, ok := el.(map[string]any); ok {
-						objs = append(objs, m)
-					} else {
-						allObj = false
-						break
-					}
-				}
-				if allObj {
-					return addressesFromObjects(objs), nil
-				}
-				strs := make([]string, 0, len(vv))
-				allStr := true
-				for _, el := range vv {
-					if s, ok := el.(string); ok {
-						strs = append(strs, s)
-					} else {
-						allStr = false
-						break
-					}
-				}
-				if allStr {
-					return strs, nil
-				}
-			}
+	out := make([]string, 0, len(items))
+	for _, it := range items {
+		if it.Address != "" {
+			out = append(out, it.Address)
 		}
 	}
-
-	return nil, fmt.Errorf("unrecognized state list JSON shape")
+	return out, nil
 }
 
-func addressesFromObjects(objs []map[string]any) []string {
-	out := make([]string, 0, len(objs))
-	for _, o := range objs {
-		if addr := stringField(o, "address"); addr != "" {
-			out = append(out, addr)
-			continue
-		}
-		typ := stringField(o, "type")
-		name := stringField(o, "name")
-		mod := stringField(o, "module")
-		switch {
-		case mod != "" && typ != "" && name != "":
-			out = append(out, mod+"."+typ+"."+name)
-		case typ != "" && name != "":
-			out = append(out, typ+"."+name)
-		case name != "":
-			out = append(out, name)
-		default:
-			b, _ := json.Marshal(o)
-			out = append(out, string(b))
+// resourceTypesFromRaw returns the distinct Type values (sorted) from a
+// resource list payload.
+func resourceTypesFromRaw(raw []byte) ([]string, error) {
+	items, err := unmarshalResources(raw)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, it := range items {
+		if it.Type != "" {
+			seen[it.Type] = struct{}{}
 		}
 	}
-	return out
+	out := make([]string, 0, len(seen))
+	for t := range seen {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out, nil
 }
 
-func stringField(m map[string]any, key string) string {
-	v, ok := m[key]
-	if !ok || v == nil {
-		return ""
+func unmarshalResources(raw []byte) ([]workspaceResource, error) {
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		return nil, nil
 	}
-	s, ok := v.(string)
-	if !ok {
-		return ""
+	var items []workspaceResource
+	if err := json.Unmarshal(raw, &items); err != nil {
+		return nil, fmt.Errorf("parse workspace resources: %w", err)
 	}
-	return s
+	return items, nil
+}
+
+// workspaceDescribeCall fires `workspace read` + `workspace resource list` in
+// parallel and merges them so the agent sees workspace metadata alongside the
+// actual resource inventory (types + count), not just a header.
+func workspaceDescribeCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_workspace_describe", Args: args}
+
+	if err := require(args, "org", "workspace"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	workspace := args["workspace"]
+
+	type fetchResult struct {
+		raw []byte
+		err *ToolError
+	}
+	chMeta := make(chan fetchResult, 1)
+	chRes := make(chan fetchResult, 1)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchWorkspaceRead(ctx, org, workspace, timeoutSec)
+		chMeta <- fetchResult{raw: raw, err: ferr}
+	}()
+	go func() {
+		defer wg.Done()
+		raw, ferr := fetchWorkspaceResources(ctx, org, workspace, timeoutSec)
+		chRes <- fetchResult{raw: raw, err: ferr}
+	}()
+	wg.Wait()
+	rMeta := <-chMeta
+	rRes := <-chRes
+
+	if rMeta.err != nil {
+		result.Err = rMeta.err
+		result.Duration = time.Since(start)
+		return result
+	}
+	if rRes.err != nil {
+		result.Err = rRes.err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	items, perr := unmarshalResources(rRes.raw)
+	if perr != nil {
+		result.Err = &ToolError{ErrorCode: "parse_error", Message: perr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	types, _ := resourceTypesFromRaw(rRes.raw)
+
+	merged := map[string]any{
+		"workspace":      json.RawMessage(rMeta.raw),
+		"resources":      json.RawMessage(rRes.raw),
+		"resource_types": types,
+		"resource_count": len(items),
+	}
+	out, mErr := json.Marshal(merged)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// fetchWorkspaceRead shells out to `hcptf workspace read` and returns the raw
+// JSON body. Errors are normalized the same way fetchWorkspaceResources does.
+func fetchWorkspaceRead(ctx context.Context, org, workspace string, timeoutSec int) ([]byte, *ToolError) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "hcptf", "workspace", "read",
+		"-org="+org,
+		"-name="+workspace,
+		"-output=json",
+	)
+	out, execErr := cmd.Output()
+	if execErr != nil {
+		retryable := false
+		msg := execErr.Error()
+		stderr := ""
+		if e, ok := execErr.(*exec.ExitError); ok {
+			stderr = strings.TrimSpace(string(e.Stderr))
+			if stderr != "" {
+				msg = stderr
+			}
+			retryable = e.ExitCode() == 1
+		}
+		if ctx.Err() != nil {
+			msg = fmt.Sprintf("tool timed out after %ds", timeoutSec)
+			retryable = true
+		}
+		if looksLikeHTML(string(out)) || looksLikeHTML(stderr) {
+			return nil, htmlGuardError()
+		}
+		return nil, &ToolError{ErrorCode: "execution_error", Message: msg, Retryable: retryable}
+	}
+	if looksLikeHTML(string(out)) {
+		return nil, htmlGuardError()
+	}
+	return out, nil
 }
 
 // Definitions returns the tool definitions for the Anthropic tool_use API.
@@ -467,7 +525,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_workspace_describe",
-			Description: "Returns workspace topology: resource types, providers, last run status, drift indicator, and state outputs.",
+			Description: "Returns workspace metadata merged with the actual resource inventory: workspace read fields under `workspace`, the full resource list under `resources`, distinct `resource_types`, and a total `resource_count`.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
