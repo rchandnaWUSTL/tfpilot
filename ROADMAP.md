@@ -62,12 +62,14 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Validation runs automatically after file write
 - Clean error codes when terraform or gh is missing from PATH
 
-## v0.7 — Plan Analyzer
-- Deep plan analysis beyond simple summarization
-- Flag risky changes: unexpected destructions, security group changes, IAM modifications
-- Blast radius scoring: rate the risk of a plan before the approval gate
-- Policy pre-check: validate against org Sentinel/OPA policies before creating a run
-- Makes the v0.5 apply gate significantly smarter
+## v0.7 — Plan Analyzer (Shipped)
+- _hcp_tf_plan_analyze tool with risk scoring heuristics
+- Risk levels: Low / Medium / High / Critical with color coding
+- Blast radius: total resources affected, additions/changes/destructions breakdown
+- Policy pre-check: surfaces failed policies, triggers Critical risk level
+- /analyze <run-id> slash command for direct plan analysis
+- Apply gate integrated: risk level determines confirmation requirements (single yes / double yes / workspace name)
+- Failed policies always trigger Critical regardless of other factors
 
 ## v0.8 — Application-Aware Infrastructure Generation
 - User runs terraform dev in their application repo root
