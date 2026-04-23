@@ -1419,6 +1419,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_pr_create" {
 		return prCreateCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_workspaces_list" {
+		return workspacesListCall(ctx, args, timeoutSec)
+	}
 	if name == "_hcp_tf_stacks_list" {
 		return stacksListCall(ctx, args, timeoutSec)
 	}
@@ -2149,6 +2152,78 @@ func parseVariables(raw []byte) ([]variableEntry, error) {
 	return out, nil
 }
 
+// workspacesListCall shells out to `hcptf workspace list` and enriches each
+// workspace with resource_count and current_run_status by fanning out parallel
+// `workspace read` calls. The base `workspace list` payload only includes
+// name/id/locked/terraform-version — without the fan-out the /workspaces
+// render would always show "0 resources" and "no runs". Read-only; visible
+// in every mode.
+func workspacesListCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_workspaces_list", Args: args}
+
+	if err := require(args, "org"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+
+	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "workspace", "list", "-org="+org, "-output=json")
+	if ferr != nil {
+		result.Err = ferr
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var workspaces []map[string]any
+	if err := json.Unmarshal(raw, &workspaces); err != nil {
+		result.Output = json.RawMessage(raw)
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var wg sync.WaitGroup
+	for i := range workspaces {
+		ws := workspaces[i]
+		name := firstStringField(ws, "name", "Name")
+		if name == "" {
+			ws["resource_count"] = 0
+			ws["current_run_status"] = ""
+			continue
+		}
+		wg.Add(1)
+		go func(w map[string]any, n string) {
+			defer wg.Done()
+			readRaw, rerr := fetchHCPTFJSON(ctx, timeoutSec, "workspace", "read", "-org="+org, "-name="+n, "-output=json")
+			if rerr != nil {
+				w["resource_count"] = 0
+				w["current_run_status"] = ""
+				return
+			}
+			var detail map[string]any
+			if err := json.Unmarshal(readRaw, &detail); err != nil {
+				w["resource_count"] = 0
+				w["current_run_status"] = ""
+				return
+			}
+			w["resource_count"] = firstIntField(detail, "ResourceCount", "resource-count", "resource_count")
+			w["current_run_status"] = firstStringField(detail, "CurrentRunStatus", "current-run-status", "current_run_status")
+		}(ws, name)
+	}
+	wg.Wait()
+
+	out, mErr := json.Marshal(workspaces)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(out)
+	result.Duration = time.Since(start)
+	return result
+}
+
 // stacksListCall shells out to `hcptf stack list` and enriches each stack
 // with deployment_count and health by fanning out parallel
 // `stack deployment list` calls. The base `stack list` payload only includes
@@ -2606,6 +2681,17 @@ func Definitions() []ToolDef {
 					"run_id":    map[string]any{"type": "string", "description": "Run ID (run-xxx)"},
 				},
 				"required": []string{"org", "workspace", "run_id"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_workspaces_list",
+			Description: "Lists HCP Terraform workspaces for an organization: returns the raw JSON array from `hcptf workspace list` with name, resource count, last-run status, and terraform version per workspace. Read-only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org": map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+				},
+				"required": []string{"org"},
 			},
 		},
 		{

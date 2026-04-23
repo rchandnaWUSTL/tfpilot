@@ -155,6 +155,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleDiagnose(parts[1:])
 	case "/stacks":
 		r.handleStacks()
+	case "/workspaces":
+		r.handleWorkspaces()
 	default:
 		boundaryPink.Printf("Unknown command: %s\n", parts[0])
 		fmt.Println("Type /help for available commands.")
@@ -449,6 +451,51 @@ func (r *REPL) handleAnalyze(args []string) {
 		return
 	}
 	renderAssessment(parseAssessment(result.Output))
+}
+
+// handleWorkspaces implements /workspaces by calling _hcp_tf_workspaces_list
+// for the pinned org and rendering a one-line-per-workspace summary.
+func (r *REPL) handleWorkspaces() {
+	if r.org == "" {
+		boundaryPink.Println("Set an org first with /org <name>")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_workspaces_list", map[string]string{"org": r.org}, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_workspaces_list: %s\n", result.Err.Message)
+		return
+	}
+
+	var workspaces []map[string]any
+	if len(result.Output) > 0 {
+		_ = json.Unmarshal(result.Output, &workspaces)
+	}
+
+	if len(workspaces) == 0 {
+		white.Printf("  No workspaces found in %s.\n", r.org)
+		return
+	}
+
+	waypointTeal.Printf("  Workspaces in %s:\n", r.org)
+	fmt.Println()
+	for _, ws := range workspaces {
+		name := stringField(ws, "name", "Name")
+		count := intField(ws, "resource_count", "ResourceCount", "resource-count")
+		status := stringField(ws, "current_run_status", "CurrentRunStatus", "current-run-status")
+		if status == "" {
+			status = "no runs"
+		}
+		fmt.Print("  • ")
+		boldWhite.Print(name)
+		fmt.Printf("    %d resources    ", count)
+		dimWhite.Println(status)
+	}
 }
 
 // handleStacks implements /stacks by calling _hcp_tf_stacks_list for the
@@ -1144,6 +1191,7 @@ func printHelp() {
 	fmt.Println("  /mode              Show current mode")
 	fmt.Println("  /analyze <run-id>  Risk assessment for a specific run")
 	fmt.Println("  /diagnose <run-id> Categorize a failed run and suggest a fix")
+	fmt.Println("  /workspaces        List all workspaces in the pinned org")
 	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
