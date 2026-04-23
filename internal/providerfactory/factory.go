@@ -3,11 +3,11 @@ package providerfactory
 import (
 	"fmt"
 
-	"github.com/rchandnaWUSTL/terraform-dev/internal/config"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/anthropic"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/copilot"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/openai"
+	"github.com/rchandnaWUSTL/tfpilot/internal/config"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/anthropic"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/copilot"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/openai"
 )
 
 // AuthMode is set by the --auth CLI flag. When non-empty it overrides the

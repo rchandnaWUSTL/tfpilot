@@ -1,4 +1,4 @@
-# Terraform Dev — PRD
+# tfpilot — PRD
 
 **Status:** v0.1–v0.6 shipped; v0.7 next
 **Owner:** Roshan Chandna
@@ -8,12 +8,12 @@
 
 ## 1. Overview
 
-Terraform Dev is an AI-native terminal REPL that lets infrastructure engineers describe what they want in plain English and have an agent drive HCP Terraform end-to-end: reading configs and state, proposing changes, running plans, interpreting diffs, enforcing policy, applying with guardrails, and reporting back.
+tfpilot is an AI-native terminal REPL that lets infrastructure engineers describe what they want in plain English and have an agent drive HCP Terraform end-to-end: reading configs and state, proposing changes, running plans, interpreting diffs, enforcing policy, applying with guardrails, and reporting back.
 
 You launch it with a single command:
 
 ```
-$ terraform-dev --org=<org> --workspace=<ws> --auth=copilot
+$ tfpilot --org=<org> --workspace=<ws> --auth=copilot
 ```
 
 From there, the prompt replaces raw CLI incantations:
@@ -40,7 +40,7 @@ Claude Code can edit `.tf` files and run commands. But it lacks the opinionated 
 
 The gap is not "LLM plus CLI." The gap is a coherent agent loop that already understands the HCP Terraform data model, respects org identity and policy, and surfaces the right information at the right time.
 
-The differentiated asset is not the agent runtime. It is the tooling contract: agent-first CLI commands that already encode HCP Terraform concepts, respect org identity, produce structured output, and emit audit logs. Terraform Dev is the thin, opinionated shell on top.
+The differentiated asset is not the agent runtime. It is the tooling contract: agent-first CLI commands that already encode HCP Terraform concepts, respect org identity, produce structured output, and emit audit logs. tfpilot is the thin, opinionated shell on top.
 
 ---
 
@@ -48,7 +48,7 @@ The differentiated asset is not the agent runtime. It is the tooling contract: a
 
 ### Shipped (v0.1–v0.6)
 
-- Working REPL with `terraform-dev` entrypoint, `hcp-tf>` prompt, history, and slash commands
+- Working REPL with `tfpilot` entrypoint, `hcp-tf>` prompt, history, and slash commands
 - Streaming agent loop with planner + tool-calling + narrative summarizer
 - Read-only mode by default; `--apply` flag unlocks mutation with synchronous approval gate
 - 9 tools: 6 read-only (runs, workspace describe/diff, variable diff, drift detect, policy check, plan summary) + 3 mutating (run create/apply/discard) + 2 config (validate, PR create)
@@ -57,7 +57,7 @@ The differentiated asset is not the agent runtime. It is the tooling contract: a
 - Natural language → Terraform config with `terraform validate` + optional `gh pr create`
 - HashiCorp brand color palette, structured response format (status line, details, next action)
 - Auth gate on startup: `hcptf` credential check with inline `hcptf login` fallback
-- Audit log at `~/.terraform-dev/audit.log` — JSON-per-line, every tool call including approval-gate cancellations
+- Audit log at `~/.tfpilot/audit.log` — JSON-per-line, every tool call including approval-gate cancellations
 
 ### In scope for v0.7 (next)
 
@@ -91,7 +91,7 @@ Primary persona: Platform Engineer or Senior DevOps Engineer who owns HCP Terraf
 
 ## 5. Architecture
 
-Terraform Dev has four layers. Each has a clearly scoped responsibility and a clean interface to the next.
+tfpilot has four layers. Each has a clearly scoped responsibility and a clean interface to the next.
 
 ### Layer 1: Agent-ready CLI (hcptf)
 
@@ -130,7 +130,7 @@ A minimal planner/summarizer loop behind a `ModelProvider` interface:
 - **Approval gate:** before any mutating tool call, the REPL prompts the user synchronously; the agent sees `user_cancelled` as a tool error when declined
 - **Streaming:** the agent response streams token-by-token for a terminal-native feel
 
-### Layer 4: Terminal UX (`terraform-dev`)
+### Layer 4: Terminal UX (`tfpilot`)
 
 A long-running REPL process that renders the conversation:
 
@@ -222,13 +222,13 @@ Every action runs under the user's scoped HCP Terraform identity (via the existi
 - **Blast radius check:** when the last observed plan summary reports destroys > 0, a second confirmation in boundary pink is required before apply.
 - **Auto-discard on cancel:** if the user cancels an apply after a run was already created, the REPL invokes `_hcp_tf_run_discard` synchronously so the run does not remain pending.
 - **Auth gate on startup:** `hcptf` credential check with inline `hcptf login` fallback; model-provider auth (Anthropic or Copilot) surfaced with a user-friendly error when missing.
-- **Audit trail:** every tool call is appended as a JSON line to `~/.terraform-dev/audit.log` with timestamp, tool, args, result, and the hcptf user identity. Approval-gate cancellations are logged too, with `error_code: user_cancelled`.
+- **Audit trail:** every tool call is appended as a JSON line to `~/.tfpilot/audit.log` with timestamp, tool, args, result, and the hcptf user identity. Approval-gate cancellations are logged too, with `error_code: user_cancelled`.
 
 ---
 
 ## 9. Configuration
 
-Config file at `~/.terraform-dev/config.yaml`. Created automatically on first run with defaults.
+Config file at `~/.tfpilot/config.yaml`. Created automatically on first run with defaults.
 
 ```yaml
 model: claude-sonnet-4-6        # Anthropic default; overridden when --auth=copilot
@@ -239,7 +239,7 @@ model_provider: anthropic       # or "openai" for OpenAI-compatible endpoints
 openai_base_url: ""             # when model_provider=openai
 ```
 
-Copilot credentials are cached at `~/.terraform-dev/copilot.json` with auto-refresh on 401.
+Copilot credentials are cached at `~/.tfpilot/copilot.json` with auto-refresh on 401.
 
 ---
 

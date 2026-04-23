@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
 )
 
 // Provider speaks the OpenAI Chat Completions API over HTTP/SSE. It accepts an

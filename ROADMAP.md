@@ -1,19 +1,19 @@
-# Terraform Dev — Roadmap
+# tfpilot — Roadmap
 
 ## v0.1 — Shipped
-- Working REPL with `terraform dev` entrypoint and `hcp-tf>` prompt
+- Working REPL with `tfpilot` entrypoint and `hcp-tf>` prompt
 - 6 read-only tools backed by hcptf CLI
 - Streaming agent loop (Claude Sonnet 4.6 via Anthropic API)
 - HashiCorp brand color palette throughout
 - Structured response format: status line, details, next action
 - Real workspace diff with parallel state fetch
 - Auth gate: hcptf credentials + ANTHROPIC_API_KEY checked at startup
-- Audit log at ~/.terraform-dev/audit.log
+- Audit log at ~/.tfpilot/audit.log
 
 ## v0.2 — Model Provider Abstraction — Shipped
 - Abstract the agent loop behind a ModelProvider interface
 - Implementations: Anthropic (current), OpenAI-compatible (new)
-- Config: `model_provider: anthropic | openai` in ~/.terraform-dev/config.yaml
+- Config: `model_provider: anthropic | openai` in ~/.tfpilot/config.yaml
 - Normalize tool call schema at the provider boundary
 - No user-facing changes; sets up v0.3
 
@@ -21,7 +21,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 
 ## v0.3 — GitHub Copilot Auth — Shipped
 - HashiCorp employees already have Copilot licenses — zero adoption barrier
-- `terraform dev --auth=copilot` uses existing Copilot credentials
+- `tfpilot --auth=copilot` uses existing Copilot credentials
 - Copilot uses OpenAI-compatible API format; rides on v0.2 abstraction
 - Reference: opencode OSS implementation for credential flow design
 - Goal: internal HashiCorp adoption with no new API keys required
@@ -34,7 +34,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Structured response format: status line, details, next action
 - HashiCorp brand color palette throughout terminal UI
 - Getting Started section in README with binary install instructions
-- Copilot token cached at ~/.terraform-dev/copilot.json with auto-refresh on 401
+- Copilot token cached at ~/.tfpilot/copilot.json with auto-refresh on 401
 
 ## v0.4 — Richer Data Surface (Shipped)
 - Multi-workspace diff with real resource addresses
@@ -49,7 +49,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Synchronous approval gate before every mutation
 - Blast radius check: second "yes" required when plan has destructions > 0
 - Auto-discard on cancel if a run was already created
-- Audit log at ~/.terraform-dev/audit.log for every tool call
+- Audit log at ~/.tfpilot/audit.log for every tool call
 - Cost estimate surfaced in plan summary when available
 - Mutating tools invisible to model in readonly mode
 
@@ -79,7 +79,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Built-in support for two community run task modules:
   - terraform-aws-runtask-tf-plan-analyzer (AWS Bedrock + Claude) — github.com/aws-ia/terraform-aws-runtask-tf-plan-analyzer
   - terraform-google-ai-debugger (Google Vertex AI + Gemini) — github.com/gautambaghel/terraform-google-ai-debugger
-- "Attach AI plan analysis to prod-k8s-apps" → terraform-dev deploys the run task and wires it to the workspace automatically
+- "Attach AI plan analysis to prod-k8s-apps" → tfpilot deploys the run task and wires it to the workspace automatically
 - Complements the local _hcp_tf_plan_analyze tool with a server-side, always-on analysis layer
 - Requires --apply mode (run task attachment is a mutation)
 
@@ -92,7 +92,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Health computed from deployment run status (Unknown when no runs exist)
 
 ## v0.10 — Application-Aware Infrastructure Generation
-- User runs terraform dev in their application repo root
+- User runs tfpilot in their application repo root
 - Agent scans the directory — infers runtime, dependencies, and resource requirements from package.json, Dockerfile, requirements.txt, etc.
 - Generates full Terraform config to deploy the application: EKS cluster, ECR repo, ALB, IAM roles, VPC
 - Plans against HCP Terraform workspace before proposing
@@ -101,8 +101,8 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 
 ## v1.0 — Public Launch
 - GoReleaser pipeline with binaries for Mac/Linux/Windows
-- Homebrew tap: `brew install terraform-dev`
-- `terraform dev` works as a Terraform CLI subcommand
+- Homebrew tap: `brew install tfpilot`
+- `tfpilot` works as a Terraform CLI subcommand
 - Public README, demo GIF, and docs site
 - GitHub Marketplace listing (requires Copilot auth + Homebrew tap first)
 - List application at: https://github.com/marketplace
@@ -110,7 +110,7 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 ## v1.1 — API Surface + Web UI
 - Wrap the agent loop in an HTTP API
 - Same tools and agent, accessible from a web chat UI
-- Makes terraform-dev accessible to non-terminal users: PMs, security teams, compliance
+- Makes tfpilot accessible to non-terminal users: PMs, security teams, compliance
 - Provider abstraction already in place — the terminal is just one UX on top
 
 ## v1.2 — Concierge Mode

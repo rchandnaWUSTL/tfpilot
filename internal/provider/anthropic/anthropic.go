@@ -8,7 +8,7 @@ import (
 
 	sdk "github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
 )
 
 type Provider struct {

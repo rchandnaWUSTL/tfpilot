@@ -16,10 +16,10 @@ import (
 
 	"github.com/chzyer/readline"
 	"github.com/fatih/color"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/agent"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/config"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/tools"
+	"github.com/rchandnaWUSTL/tfpilot/internal/agent"
+	"github.com/rchandnaWUSTL/tfpilot/internal/config"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/tools"
 )
 
 var (
@@ -1109,33 +1109,24 @@ func stripMarkdown(line string) string {
 
 func printBanner(cfg *config.Config) {
 	tfRows := []string{
-		"  ████████╗███████╗██████╗ ██████╗  █████╗ ███████╗ ██████╗ ██████╗ ███╗   ███╗",
-		"  ╚══██╔══╝██╔════╝██╔══██╗██╔══██╗██╔══██╗██╔════╝██╔═══██╗██╔══██╗████╗ ████║",
-		"     ██║   █████╗  ██████╔╝██████╔╝███████║█████╗  ██║   ██║██████╔╝██╔████╔██║",
-		"     ██║   ██╔══╝  ██╔══██╗██╔══██╗██╔══██║██╔══╝  ██║   ██║██╔══██╗██║╚██╔╝██║",
-		"     ██║   ███████╗██║  ██║██║  ██║██║  ██║██║     ╚██████╔╝██║  ██║██║ ╚═╝ ██║",
-		"     ╚═╝   ╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝      ╚═════╝ ╚═╝  ╚═╝╚═╝     ╚═╝",
-	}
-	devRows := []string{
-		"██████╗ ███████╗██╗   ██╗",
-		"██╔══██╗██╔════╝██║   ██║",
-		"██║  ██║█████╗  ██║   ██║",
-		"██║  ██║██╔══╝  ╚██╗ ██╔╝",
-		"██████╔╝███████╗ ╚████╔╝ ",
-		"╚═════╝ ╚══════╝  ╚═══╝  ",
+		"  ████████╗███████╗██████╗ ██╗██╗      ██████╗ ████████╗",
+		"  ╚══██╔══╝██╔════╝██╔══██╗██║██║     ██╔═══██╗╚══██╔══╝",
+		"     ██║   █████╗  ██████╔╝██║██║     ██║   ██║   ██║   ",
+		"     ██║   ██╔══╝  ██╔═══╝ ██║██║     ██║   ██║   ██║   ",
+		"     ██║   ██║     ██║     ██║███████╗╚██████╔╝   ██║   ",
+		"     ╚═╝   ╚═╝     ╚═╝     ╚═╝╚══════╝ ╚═════╝    ╚═╝   ",
 	}
 
 	fmt.Println()
 	for i := range tfRows {
-		tfPurple.Print(tfRows[i])
-		packerBlue.Println(devRows[i])
+		tfPurple.Println(tfRows[i])
 	}
 	fmt.Println()
 	white.Println("  AI-powered development for infrastructure-as-code")
 	dimWhite.Println("  v0.1.0 • Type /help for commands")
 	fmt.Println()
 
-	sepWidth := utf8.RuneCountInString(tfRows[0] + devRows[0])
+	sepWidth := utf8.RuneCountInString(tfRows[0])
 	dimWhite.Println(strings.Repeat("-", sepWidth))
 	fmt.Println()
 	mode := "readonly"
@@ -1167,7 +1158,7 @@ func printHelp() {
 
 func historyPath() string {
 	home, _ := os.UserHomeDir()
-	dir := home + "/.terraform-dev"
+	dir := home + "/.tfpilot"
 	_ = os.MkdirAll(dir, 0700)
 	return dir + "/history"
 }

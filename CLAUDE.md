@@ -565,9 +565,9 @@ Tasks can be linked to express relationships. Use `aiki task link` to create lin
 **Cycle detection:** `blocked-by` and `subtask-of` links are checked for cycles at write time.
 </aiki>
 
-# Terraform Dev — Agent Instructions
+# tfpilot — Agent Instructions
 
-You are working on **Terraform Dev**: an AI-native terminal REPL where infrastructure engineers describe intent in plain English and an agent drives HCP Terraform end-to-end.
+You are working on **tfpilot**: an AI-native terminal REPL where infrastructure engineers describe intent in plain English and an agent drives HCP Terraform end-to-end.
 
 v0.1–v0.6 are shipped. The codebase runs against a live HCP Terraform org.
 
@@ -590,8 +590,8 @@ If an `aiki build` autonomous run is dispatched and a subtask stalls for more th
 
 ## Repository layout
 
-- `cmd/terraform-dev/` — entrypoint, flag parsing, startup auth check
-- `internal/config/` — YAML config loader (`~/.terraform-dev/config.yaml`)
+- `cmd/tfpilot/` — entrypoint, flag parsing, startup auth check
+- `internal/config/` — YAML config loader (`~/.tfpilot/config.yaml`)
 - `internal/provider/` — `ModelProvider` interface + Anthropic, OpenAI, Copilot implementations
 - `internal/providerfactory/` — wires provider selection from auth mode + config
 - `internal/tools/` — tool dispatch, hcptf shell-out, error normalization, audit log
@@ -602,19 +602,19 @@ If an `aiki build` autonomous run is dispatched and a subtask stalls for more th
 ## Build and test
 
 ```bash
-go build -o terraform-dev ./cmd/terraform-dev
+go build -o tfpilot ./cmd/tfpilot
 go test ./...
 ```
 
 ## Run the REPL
 
 ```bash
-./terraform-dev --org=<org> --workspace=<ws> --auth=copilot            # readonly
-./terraform-dev --org=<org> --workspace=<ws> --auth=copilot --apply    # mutation-enabled
+./tfpilot --org=<org> --workspace=<ws> --auth=copilot            # readonly
+./tfpilot --org=<org> --workspace=<ws> --auth=copilot --apply    # mutation-enabled
 ```
 
 Test org: `sarah-test-org`, workspace: `prod-k8s-apps` (2 null_resources, safe to mutate).
-Copilot token cached at `~/.terraform-dev/copilot.json`; `ANTHROPIC_API_KEY` is a fallback.
+Copilot token cached at `~/.tfpilot/copilot.json`; `ANTHROPIC_API_KEY` is a fallback.
 
 ## Key constraints
 
@@ -625,7 +625,7 @@ Copilot token cached at `~/.terraform-dev/copilot.json`; `ANTHROPIC_API_KEY` is 
 - Plans with destroys > 0 require a second `yes` at the apply gate
 - If the user cancels an apply after a run was created, the REPL auto-invokes `_hcp_tf_run_discard`
 - Agent responses stream token-by-token
-- Every tool call — including gate cancellations — is appended as a JSON line to `~/.terraform-dev/audit.log`
+- Every tool call — including gate cancellations — is appended as a JSON line to `~/.tfpilot/audit.log`
 - The system prompt is mode-aware (readonly vs. apply) and always carries the config-generation rules
 - Generated HCL in fenced `hcl`/`terraform`/`tf` blocks is written to the cwd by the REPL; existing files prompt before overwrite; validation runs automatically after write
 

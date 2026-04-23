@@ -1,11 +1,11 @@
 build:
-	go build -o terraform-dev ./cmd/terraform-dev/
+	go build -o tfpilot ./cmd/tfpilot/
 
 run: build
-	PATH="$(HOME)/bin:$(PATH)" ./terraform-dev
+	PATH="$(HOME)/bin:$(PATH)" ./tfpilot
 
 install: build
-	cp terraform-dev $(HOME)/bin/terraform-dev
+	cp tfpilot $(HOME)/bin/tfpilot
 
 test:
 	go test ./...

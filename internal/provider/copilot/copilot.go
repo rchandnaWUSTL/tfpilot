@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/openai"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/openai"
 )
 
 // Provider wraps the OpenAI chat provider with Copilot-specific auth:

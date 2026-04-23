@@ -1,4 +1,4 @@
-module github.com/rchandnaWUSTL/terraform-dev
+module github.com/rchandnaWUSTL/tfpilot
 
 go 1.25.0
 

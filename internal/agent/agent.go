@@ -5,9 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/rchandnaWUSTL/terraform-dev/internal/config"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/tools"
+	"github.com/rchandnaWUSTL/tfpilot/internal/config"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/tools"
 )
 
 const systemPromptCore = `You are an AI agent for HCP Terraform. You help infrastructure engineers understand their workspaces, runs, drift, and policies by calling tools and reporting findings in plain prose.

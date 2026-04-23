@@ -11,8 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/copilot"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/copilot"
 )
 
 // inMemStore is a test-only Store that keeps a single CachedToken in memory.

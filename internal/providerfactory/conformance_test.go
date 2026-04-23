@@ -11,10 +11,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/anthropic"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/openai"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/tools"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/anthropic"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/openai"
+	"github.com/rchandnaWUSTL/tfpilot/internal/tools"
 )
 
 // Conformance test: for each tool, we feed each provider a canned response

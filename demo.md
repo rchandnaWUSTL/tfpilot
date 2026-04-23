@@ -1,11 +1,11 @@
-# Terraform Dev — Demo Script
+# tfpilot — Demo Script
 
 A 6-prompt walkthrough that shows the v0.6 feature surface end-to-end against a live HCP Terraform org. ~6 minutes total.
 
 ## Setup
 
 ```bash
-./terraform-dev --org=sarah-test-org --workspace=prod-k8s-apps --auth=copilot --apply
+./tfpilot --org=sarah-test-org --workspace=prod-k8s-apps --auth=copilot --apply
 ```
 
 - `--auth=copilot` uses the user's existing GitHub Copilot license — no new API keys
@@ -48,7 +48,7 @@ A 6-prompt walkthrough that shows the v0.6 feature surface end-to-end against a 
 
 - Zero new API keys with `--auth=copilot` (uses existing Copilot license)
 - Read-only by default — nothing changes without explicit approval
-- Every action logged to `~/.terraform-dev/audit.log`
+- Every action logged to `~/.tfpilot/audit.log`
 - HashiCorp brand colors throughout
 - Runs on gpt-4o via Copilot or claude-sonnet-4-6 via Anthropic
 
@@ -56,7 +56,7 @@ A 6-prompt walkthrough that shows the v0.6 feature surface end-to-end against a 
 
 ```bash
 /exit
-cat ~/.terraform-dev/audit.log | tail -10
+cat ~/.tfpilot/audit.log | tail -10
 ```
 
 Shows the JSON-line audit trail of every tool call — including the cancelled run_create with `error_code: user_cancelled` — as the closing beat.

@@ -25,7 +25,7 @@ const ClientID = "Iv1.b507a08c87ecfe98"
 
 // Version is reported in the Copilot-required User-Agent / Editor-Version
 // headers. Keep in lockstep with the binary's release tag.
-const Version = "terraform-dev/0.2.0"
+const Version = "tfpilot/0.2.0"
 
 // DeploymentType distinguishes github.com accounts (individual Copilot) from
 // customers on GitHub Enterprise Cloud / Server. The device-flow and chat
@@ -63,13 +63,13 @@ type Store interface {
 	Save(*CachedToken) error
 }
 
-// DefaultStorePath returns ~/.terraform-dev/copilot.json.
+// DefaultStorePath returns ~/.tfpilot/copilot.json.
 func DefaultStorePath() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".terraform-dev", "copilot.json"), nil
+	return filepath.Join(home, ".tfpilot", "copilot.json"), nil
 }
 
 // NewFileStore returns a Store backed by a 0600-permission file.

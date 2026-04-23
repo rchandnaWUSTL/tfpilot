@@ -1,7 +1,7 @@
 # v0.9 Stacks Integration
 
 ## Context
-terraform-dev v0.7 is shipped. This plan adds Terraform Stacks awareness to the agent — stack discovery, component and deployment topology, stack health, and guidance on when to use Stacks vs workspaces.
+tfpilot v0.7 is shipped. This plan adds Terraform Stacks awareness to the agent — stack discovery, component and deployment topology, stack health, and guidance on when to use Stacks vs workspaces.
 
 Live org for testing: sarah-test-org
 Auth: --auth=copilot or source .env for ANTHROPIC_API_KEY
@@ -106,11 +106,11 @@ Mark v0.9 as in progress. Add to the v0.9 section what's being built.
 ### Testing
 After implementation, sync to main repo and run:
 
-1. go build -o terraform-dev ./cmd/terraform-dev
+1. go build -o tfpilot ./cmd/tfpilot
 2. go test ./... — all green
 
 3. /stacks slash command test:
-   ./terraform-dev --org=sarah-test-org --auth=copilot
+   ./tfpilot --org=sarah-test-org --auth=copilot
    /stacks
    Expected: list of stacks in sarah-test-org, or "No stacks found" with guidance
 

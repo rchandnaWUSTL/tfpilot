@@ -9,9 +9,9 @@ import (
 	"os/exec"
 
 	"github.com/fatih/color"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/config"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/providerfactory"
-	"github.com/rchandnaWUSTL/terraform-dev/internal/repl"
+	"github.com/rchandnaWUSTL/tfpilot/internal/config"
+	"github.com/rchandnaWUSTL/tfpilot/internal/providerfactory"
+	"github.com/rchandnaWUSTL/tfpilot/internal/repl"
 )
 
 var (

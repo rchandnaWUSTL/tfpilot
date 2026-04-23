@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/rchandnaWUSTL/terraform-dev/internal/provider/anthropic"
+	"github.com/rchandnaWUSTL/tfpilot/internal/provider/anthropic"
 )
 
 func TestStartupChecks_MissingHcptf(t *testing.T) {

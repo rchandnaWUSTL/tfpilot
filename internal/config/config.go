@@ -61,7 +61,7 @@ func configPath() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return filepath.Join(home, ".terraform-dev", "config.yaml"), nil
+	return filepath.Join(home, ".tfpilot", "config.yaml"), nil
 }
 
 func writeDefaults(path string) error {
