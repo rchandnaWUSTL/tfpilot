@@ -21,6 +21,7 @@ vendor/
 
 # Beads tracking (local only)
 .beads/
-*.gif
 .terraform/
+# Screen recordings: ignore scratch casts but keep committed demo gifs
 demo*.cast
+*.gif.tmp
