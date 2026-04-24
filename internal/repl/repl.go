@@ -998,6 +998,19 @@ func describeAction(name string, args map[string]string) string {
 		return "apply the pending run"
 	case "_hcp_tf_run_discard":
 		return "discard the pending run"
+	case "_hcp_tf_workspace_create":
+		if n := args["name"]; n != "" {
+			if p := args["project"]; p != "" {
+				return fmt.Sprintf("create workspace %s in project %s", n, p)
+			}
+			return fmt.Sprintf("create workspace %s", n)
+		}
+		return "create a new workspace"
+	case "_hcp_tf_workspace_populate":
+		if ws := args["workspace"]; ws != "" {
+			return fmt.Sprintf("upload config and trigger a run in %s", ws)
+		}
+		return "upload config and trigger a run"
 	}
 	return "perform a mutation"
 }
@@ -1062,6 +1075,62 @@ func (r *REPL) handleGeneratedConfig(ctx context.Context, response string) {
 	defer vcancel()
 	result := tools.Call(vctx, "_hcp_tf_config_validate", map[string]string{"config_path": cwd}, r.cfg.TimeoutSeconds*6)
 	printToolResult("_hcp_tf_config_validate", result)
+
+	r.offerDirectApply(ctx, result, blocks)
+}
+
+// offerDirectApply prompts the user to upload the just-generated config to the
+// current workspace and trigger a run, when all preconditions hold: validation
+// succeeded, the REPL is in --apply mode, and both org + workspace were bound
+// at startup. The call flows through the standard mutation approval gate.
+func (r *REPL) offerDirectApply(ctx context.Context, validateResult *tools.CallResult, blocks [][]string) {
+	if r.cfg.Readonly || r.org == "" || r.workspace == "" {
+		return
+	}
+	if validateResult == nil || validateResult.Err != nil {
+		return
+	}
+	var parsed struct {
+		Valid *bool `json:"valid"`
+	}
+	if len(validateResult.Output) > 0 {
+		if err := json.Unmarshal(validateResult.Output, &parsed); err == nil && parsed.Valid != nil && !*parsed.Valid {
+			return
+		}
+	}
+
+	var combined strings.Builder
+	for i, m := range blocks {
+		body := reFilenameHint.ReplaceAllString(m[1], "")
+		combined.WriteString(strings.TrimSpace(body))
+		if i < len(blocks)-1 {
+			combined.WriteString("\n\n")
+		}
+	}
+	if combined.Len() == 0 {
+		return
+	}
+
+	fmt.Println()
+	vaultYellow.Printf("  ⚠ Apply this config directly to %s? Type 'yes' to upload and trigger a run, or anything else to keep it local only.\n", r.workspace)
+	if !r.readYes() {
+		return
+	}
+
+	args := map[string]string{
+		"org":       r.org,
+		"workspace": r.workspace,
+		"config":    combined.String(),
+	}
+	if !r.approveMutation("_hcp_tf_workspace_populate", args) {
+		return
+	}
+
+	spin := startToolSpinner(agent.ToolCallEvent{Name: "_hcp_tf_workspace_populate", Args: map[string]string{"org": r.org, "workspace": r.workspace}})
+	pctx, pcancel := context.WithTimeout(ctx, time.Duration(r.cfg.TimeoutSeconds*6)*time.Second)
+	defer pcancel()
+	popResult := tools.Call(pctx, "_hcp_tf_workspace_populate", args, r.cfg.TimeoutSeconds*6)
+	spin.finish("_hcp_tf_workspace_populate", popResult)
 }
 
 var spinnerFrames = []string{"|", "/", "-", "\\"}

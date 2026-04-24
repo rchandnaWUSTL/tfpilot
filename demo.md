@@ -1,48 +1,61 @@
 # tfpilot — Demo Script
 
-A 6-prompt walkthrough that shows the v0.6 feature surface end-to-end against a live HCP Terraform org. ~6 minutes total.
+An 8-prompt walkthrough that shows the v0.11 feature surface end-to-end against a live HCP Terraform org. ~8 minutes total.
 
 ## Setup
 
 ```bash
-./tfpilot --org=sarah-test-org --workspace=prod-k8s-apps --auth=copilot --apply
+./tfpilot --org=sarah-test-org --workspace=prod-api --auth=copilot --apply
 ```
 
 - `--auth=copilot` uses the user's existing GitHub Copilot license — no new API keys
 - `--apply` unlocks mutation mode; remove it for the readonly-only portion of the demo
 - Confirm the banner shows `mode: apply` and the model name (`gpt-4o` under Copilot, `claude-sonnet-4-6` under Anthropic)
+- `prod-api` and `staging-api` live in the `zzryan` project and were themselves created by tfpilot — see `ops/now/v11-workspace-lifecycle-demo-log.md`
+
+## Act 0 — Setup (2 prompts, only if starting from a clean org)
+
+Skip this act if `prod-api` and `staging-api` already exist.
+
+1. **"Create a workspace called prod-api in the zzryan project"**
+   Shows: approval gate, `_hcp_tf_workspace_create` called, workspace URL surfaced.
+   Expected: `prod-api` appears under the zzryan project in the HCP Terraform UI.
+
+2. **"Generate a VPC, public subnet, EC2 instance, and security group as null_resources for prod-api, and apply it"**
+   Shows: HCL generated, `_hcp_tf_config_validate` passes, "Apply this config directly to prod-api?" prompt, `_hcp_tf_workspace_populate` fires, run triggered.
+   Expected: configuration version uploaded, run reaches `planned` / `cost_estimated`, ready for apply.
 
 ## Act 1 — Discovery (2 prompts)
 
-1. **"Describe the prod-k8s-apps workspace"**
+3. **"Describe the prod-api workspace"**
    Shows: single tool call (`_hcp_tf_workspace_describe`), structured status-line response, resource count and types, last-run summary.
    Expected: ✓ Healthy status line, plain-prose summary, no run IDs leaked.
 
-2. **"Any of my workspaces drifted this week?"**
+4. **"Any of my workspaces drifted this week?"**
    Shows: `_hcp_tf_drift_detect` called automatically, narrative summary of which workspaces show drift.
    Expected: per-workspace verdict with specific changed resources, or "No drift detected" with a next-action sentence.
 
 ## Act 2 — Comparison (2 prompts)
 
-3. **"Compare prod-k8s-apps with staging-k8s-apps"**
+5. **"Compare prod-api with staging-api"**
    Shows: `_hcp_tf_workspace_diff` with parallel state fetch, structured resource-address diff.
-   Expected: resources missing in each workspace, resources in both, per-workspace counts — all in prose, never as IDs.
+   Expected: prod-api has EC2 instance + security group that staging-api is missing, both share the VPC and public subnet — all in prose, never as IDs.
 
-4. **"What variables differ between those two workspaces?"**
+6. **"What variables differ between those two workspaces?"**
    Shows: `_hcp_tf_variable_diff` returning keys only (values never exposed even when the CLI has them), sensitive flag preserved.
    Expected: keys unique to each workspace, keys in both, sensitive markers highlighted.
 
-## Act 3 — Apply with approval (1 prompt)
+## Act 3 — Apply with plan analysis (1 prompt)
 
-5. **"Create a new run in prod-k8s-apps"**
-   Shows: plan summary first, approval gate, type "no" to cancel safely.
-   Expected: "Cancelled." printed, run discarded, audit log updated.
+7. **"Create a new run in prod-api and analyze the plan before applying"**
+   Shows: `_hcp_tf_run_create` → `_hcp_tf_plan_analyze` fires automatically, risk scoring rendered (Low/Medium/High/Critical) with blast radius, apply gate scales the confirmation prompt to the risk level. Type "no" to cancel safely.
+   Expected: plan-analyzer verdict surfaces before the confirmation prompt; "Cancelled." printed on no, run auto-discarded, audit log updated.
 
 ## Act 4 — Config generation (1 prompt)
 
-6. **"Generate a null_resource called hello_world"**
-   Shows: HCL generated, validated, written to disk, PR option offered.
-   Expected: `./suggested_config.tf` on disk, `_hcp_tf_config_validate` returns `{valid: true, errors: []}`, agent offers Option A (keep local) / Option B (open PR via `_hcp_tf_pr_create`).
+8. **"Generate a null_resource called hello_world"**
+   Shows: HCL generated, validated, written to disk, direct-apply + PR options offered.
+   Expected: `./suggested_config.tf` on disk, `_hcp_tf_config_validate` returns `{valid: true, errors: []}`, agent offers Option A (keep local) / Option B (apply directly to prod-api via `_hcp_tf_workspace_populate`) / Option C (open PR via `_hcp_tf_pr_create`).
 
 ## Key talking points
 

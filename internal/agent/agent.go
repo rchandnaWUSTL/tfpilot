@@ -71,9 +71,14 @@ const configGenRules = `
 Config generation:
 - When the user asks to generate, create, or add Terraform configuration, emit the HCL inside a fenced code block tagged hcl or terraform. The first line of the block may contain a comment like "# filename: main.tf" to choose the file name; otherwise the content is written to suggested_config.tf in the current working directory.
 - The REPL saves the code block to disk and automatically calls _hcp_tf_config_validate against the directory. If validation reports errors, revise the config and re-emit a corrected block.
-- After the code is shown, offer the user two options in plain prose: (A) the files are already saved locally, (B) open a pull request by asking you to call _hcp_tf_pr_create with a branch name and commit message.
+- After the code is shown, offer the user three options in plain prose: (A) the files are already saved locally, (B) apply the config directly to the current workspace via _hcp_tf_workspace_populate (only in --apply mode when a workspace is bound), or (C) open a pull request by asking you to call _hcp_tf_pr_create with a branch name and commit message.
 - Never generate config that includes hardcoded credentials, account IDs, or other sensitive values — use variables and reference them from the workspace's existing variable set.
-- Generated config must follow HashiCorp style: 2-space indentation, variables at the top of the file, resources before data sources.`
+- Generated config must follow HashiCorp style: 2-space indentation, variables at the top of the file, resources before data sources.
+
+Workspace lifecycle:
+- To create a new workspace, call _hcp_tf_workspace_create with org and name. Optional: project (by name — the tool resolves it to a project ID automatically), description, terraform_version. Mutating — requires --apply.
+- To provision resources into a workspace, call _hcp_tf_workspace_populate with org, workspace, and the full HCL as a single config string. The tool writes main.tf, best-effort terraform init, uploads a new configuration version, and triggers a run. Mutating — requires --apply.
+- Always generate and mentally validate the HCL before calling _hcp_tf_workspace_populate. The REPL also offers a post-generation "apply directly" prompt after validation, so prefer emitting HCL first and letting the user confirm the populate step — only call _hcp_tf_workspace_populate explicitly if the user asked for apply-in-one-step.`
 
 func buildSystemPrompt(readonly bool) string {
 	rules := modeRulesApply

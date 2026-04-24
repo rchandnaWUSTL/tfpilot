@@ -63,6 +63,7 @@ export ANTHROPIC_API_KEY=your-key
 - Apply gates that scale with risk level (approval required, double confirmation for destructions)
 - HCP Terraform Stacks support with Stack vs workspace guidance
 - Config generation — describe intent, get valid HCL written to disk
+- Workspace creation and resource provisioning from natural language — describe the workspace and resources, and tfpilot creates, uploads, and queues a run in one step
 
 ---
 

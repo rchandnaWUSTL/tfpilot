@@ -99,6 +99,13 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Opens a PR to the connected VCS repo
 - Requires v0.6 config generation foundation
 
+## v0.11 — Workspace Lifecycle (Shipped)
+- _hcp_tf_workspace_create: creates a workspace in an org, resolving a project name to a project_id automatically
+- _hcp_tf_workspace_populate: writes HCL to a tempdir, best-effort `terraform init`, uploads a configuration version, and triggers a run in one tool call
+- Direct-apply offer in the config-generation flow — after validation succeeds in --apply mode with a bound workspace, the REPL prompts "Apply this config directly to <ws>?" and routes through the mutation approval gate
+- Archivist one-shot UploadURL handled by capturing the URL from `configversion create` and PUT-ing the tar.gz directly, since hcptf's `configversion upload` cannot re-fetch it
+- Demo environment (prod-api + staging-api in sarah-test-org / zzryan project) provisioned by tfpilot itself as the validation step; see ops/now/v11-workspace-lifecycle-demo-log.md for the durable record
+
 ## v1.0 — Public Launch
 - GoReleaser pipeline with binaries for Mac/Linux/Windows
 - Homebrew tap: `brew install tfpilot`

@@ -166,6 +166,8 @@ A long-running REPL process that renders the conversation:
 | `_hcp_tf_run_create` | Creates a new run in a workspace |
 | `_hcp_tf_run_apply` | Applies a previously-created run — the only tool that triggers real infrastructure changes |
 | `_hcp_tf_run_discard` | Discards a pending run so it cannot be applied |
+| `_hcp_tf_workspace_create` | Creates a new workspace in an org, optionally inside a named project. Returns `{ workspace_id, name, org, project, url }`. |
+| `_hcp_tf_workspace_populate` | Writes an HCL string to a temp dir, uploads a configuration version to the archivist, and triggers a run in one call. Returns `{ run_id, status, workspace, terraform_init }`. |
 
 ### Config generation tools (always available)
 

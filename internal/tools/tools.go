@@ -1,9 +1,14 @@
 package tools
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,9 +23,11 @@ import (
 // Terraform. The REPL approval gate and the readonly-mode filter key off this
 // set.
 var MutatingTools = map[string]bool{
-	"_hcp_tf_run_create":  true,
-	"_hcp_tf_run_apply":   true,
-	"_hcp_tf_run_discard": true,
+	"_hcp_tf_run_create":         true,
+	"_hcp_tf_run_apply":          true,
+	"_hcp_tf_run_discard":        true,
+	"_hcp_tf_workspace_create":   true,
+	"_hcp_tf_workspace_populate": true,
 }
 
 // IsMutating reports whether a tool name triggers state changes.
@@ -1431,6 +1438,12 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_stack_vs_workspace" {
 		return stackVsWorkspaceCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_workspace_create" {
+		return workspaceCreateCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_workspace_populate" {
+		return workspacePopulateCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -1608,6 +1621,338 @@ func runDiscard(args map[string]string) ([]string, error) {
 		"-id=" + args["run_id"],
 		"-comment=" + args["comment"],
 	}, nil
+}
+
+func workspaceCreateCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_workspace_create", Args: args}
+
+	if err := require(args, "org", "name"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	org := args["org"]
+	name := args["name"]
+
+	cmdArgs := []string{"workspace", "create",
+		"-org=" + org,
+		"-name=" + name,
+	}
+
+	projectInput := strings.TrimSpace(args["project"])
+	projectID := strings.TrimSpace(args["project_id"])
+	resolvedProjectName := ""
+	if projectID == "" && projectInput != "" {
+		if strings.HasPrefix(projectInput, "prj-") {
+			projectID = projectInput
+		} else {
+			id, pname, perr := resolveProjectID(ctx, org, projectInput, timeoutSec)
+			if perr != nil {
+				result.Err = perr
+				result.Duration = time.Since(start)
+				return result
+			}
+			projectID = id
+			resolvedProjectName = pname
+		}
+	}
+	if projectID != "" {
+		cmdArgs = append(cmdArgs, "-project-id="+projectID)
+	}
+
+	if d := strings.TrimSpace(args["description"]); d != "" {
+		cmdArgs = append(cmdArgs, "-description="+d)
+	}
+	if tv := strings.TrimSpace(args["terraform_version"]); tv != "" {
+		cmdArgs = append(cmdArgs, "-terraform-version="+tv)
+	}
+	cmdArgs = append(cmdArgs, "-output=json")
+
+	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, cmdArgs...)
+	if ferr != nil {
+		result.Err = ferr
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(raw, &parsed); err != nil {
+		parsed = map[string]any{}
+	}
+
+	out := map[string]any{
+		"name": name,
+		"org":  org,
+	}
+	if v, ok := parsed["ID"]; ok {
+		out["workspace_id"] = v
+	} else if v, ok := parsed["id"]; ok {
+		out["workspace_id"] = v
+	}
+	if v, ok := parsed["Name"]; ok {
+		out["name"] = v
+	}
+	if v, ok := parsed["Description"]; ok && v != nil && v != "" {
+		out["description"] = v
+	}
+	if v, ok := parsed["TerraformVersion"]; ok && v != nil && v != "" {
+		out["terraform_version"] = v
+	}
+	if projectID != "" {
+		out["project_id"] = projectID
+	}
+	if resolvedProjectName != "" {
+		out["project"] = resolvedProjectName
+	} else if projectInput != "" && !strings.HasPrefix(projectInput, "prj-") {
+		out["project"] = projectInput
+	}
+	out["url"] = fmt.Sprintf("https://app.terraform.io/app/%s/workspaces/%s", org, name)
+
+	encoded, err := json.Marshal(out)
+	if err != nil {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "marshal workspace create result: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(encoded)
+	result.Duration = time.Since(start)
+	return result
+}
+
+func workspacePopulateCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_workspace_populate", Args: args}
+
+	if err := require(args, "org", "workspace", "config"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	workspace := args["workspace"]
+	config := args["config"]
+	message := strings.TrimSpace(args["message"])
+	if message == "" {
+		message = "tfpilot: initial resource provisioning"
+	}
+
+	dir, err := os.MkdirTemp("", "tfpilot-populate-*")
+	if err != nil {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "tempdir: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	defer os.RemoveAll(dir)
+
+	if err := os.WriteFile(filepath.Join(dir, "main.tf"), []byte(config), 0o644); err != nil {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "write main.tf: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	initStatus := "skipped: terraform not on PATH"
+	if _, err := exec.LookPath("terraform"); err == nil {
+		ictx, icancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+		initCmd := exec.CommandContext(ictx, "terraform", "init", "-backend=false", "-input=false", "-no-color")
+		initCmd.Dir = dir
+		if ierr := initCmd.Run(); ierr != nil {
+			initStatus = "failed: " + ierr.Error()
+		} else {
+			initStatus = "ok"
+		}
+		icancel()
+	}
+
+	out := map[string]any{
+		"workspace":      workspace,
+		"org":            org,
+		"terraform_init": initStatus,
+	}
+
+	cvRaw, cvErr := fetchHCPTFJSON(ctx, timeoutSec, "configversion", "create",
+		"-org="+org, "-workspace="+workspace, "-output=json")
+	if cvErr != nil {
+		if strings.Contains(strings.ToLower(cvErr.Message), "unknown") || strings.Contains(strings.ToLower(cvErr.Message), "no such") {
+			out["note"] = "Config version upload unavailable — workspace must be VCS-connected or config uploaded out of band."
+		} else {
+			result.Err = cvErr
+			result.Duration = time.Since(start)
+			return result
+		}
+	} else {
+		var cvParsed map[string]any
+		_ = json.Unmarshal(cvRaw, &cvParsed)
+		cvID := ""
+		for _, k := range []string{"ID", "id", "ConfigurationVersionID", "configuration_version_id"} {
+			if v, ok := cvParsed[k].(string); ok && v != "" {
+				cvID = v
+				break
+			}
+		}
+		uploadURL := ""
+		for _, k := range []string{"UploadURL", "upload_url"} {
+			if v, ok := cvParsed[k].(string); ok && v != "" {
+				uploadURL = v
+				break
+			}
+		}
+		if cvID == "" {
+			result.Err = &ToolError{ErrorCode: "execution_error", Message: "configversion create did not return an ID"}
+			result.Duration = time.Since(start)
+			return result
+		}
+		if uploadURL == "" {
+			result.Err = &ToolError{ErrorCode: "execution_error", Message: "configversion create did not return an UploadURL (it is one-shot on create — the hcptf upload subcommand cannot refetch it)"}
+			result.Duration = time.Since(start)
+			return result
+		}
+		out["configuration_version_id"] = cvID
+
+		tarball, terr := tarGzDir(dir)
+		if terr != nil {
+			result.Err = &ToolError{ErrorCode: "execution_error", Message: "tar.gz: " + terr.Error()}
+			result.Duration = time.Since(start)
+			return result
+		}
+		if uerr := putArchivist(ctx, uploadURL, tarball, timeoutSec); uerr != nil {
+			result.Err = uerr
+			result.Duration = time.Since(start)
+			return result
+		}
+	}
+
+	runRaw, rerr := fetchHCPTFJSON(ctx, timeoutSec, "run", "create",
+		"-org="+org, "-workspace="+workspace, "-message="+message, "-output=json")
+	if rerr != nil {
+		result.Err = rerr
+		result.Duration = time.Since(start)
+		return result
+	}
+	var runParsed map[string]any
+	_ = json.Unmarshal(runRaw, &runParsed)
+	for _, k := range []string{"ID", "id", "RunID", "run_id"} {
+		if v, ok := runParsed[k].(string); ok && v != "" {
+			out["run_id"] = v
+			break
+		}
+	}
+	status := ""
+	for _, k := range []string{"Status", "status"} {
+		if v, ok := runParsed[k].(string); ok && v != "" {
+			status = v
+			break
+		}
+	}
+	if status == "" {
+		status = "pending"
+	}
+	out["status"] = status
+	out["message"] = "Run triggered. Use _hcp_tf_runs_list_recent to check status."
+
+	encoded, merr := json.Marshal(out)
+	if merr != nil {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "marshal populate result: " + merr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(encoded)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// tarGzDir walks dir and returns a gzipped tar archive of every regular file
+// inside it, with paths relative to dir. Used to hand configuration bundles to
+// the HCP Terraform archivist service, which ingests tar.gz payloads.
+func tarGzDir(dir string) ([]byte, error) {
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	err := filepath.Walk(dir, func(path string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		rel, rerr := filepath.Rel(dir, path)
+		if rerr != nil {
+			return rerr
+		}
+		f, ferr := os.Open(path)
+		if ferr != nil {
+			return ferr
+		}
+		defer f.Close()
+		hdr := &tar.Header{
+			Name:    rel,
+			Mode:    int64(info.Mode().Perm()),
+			Size:    info.Size(),
+			ModTime: info.ModTime(),
+		}
+		if werr := tw.WriteHeader(hdr); werr != nil {
+			return werr
+		}
+		if _, werr := io.Copy(tw, f); werr != nil {
+			return werr
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := tw.Close(); err != nil {
+		return nil, err
+	}
+	if err := gz.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// putArchivist PUTs an octet-stream payload to the one-shot upload URL
+// returned by `hcptf configversion create`. Treated as a raw HTTP call rather
+// than an hcptf subcommand because the URL expires almost immediately after
+// create, so it cannot be re-fetched by a second hcptf invocation.
+func putArchivist(ctx context.Context, url string, body []byte, timeoutSec int) *ToolError {
+	rctx, rcancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer rcancel()
+	req, err := http.NewRequestWithContext(rctx, http.MethodPut, url, bytes.NewReader(body))
+	if err != nil {
+		return &ToolError{ErrorCode: "execution_error", Message: "build upload request: " + err.Error()}
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return &ToolError{ErrorCode: "execution_error", Message: "upload: " + err.Error(), Retryable: true}
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return &ToolError{ErrorCode: "execution_error", Message: fmt.Sprintf("upload returned HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(snippet)))}
+	}
+	return nil
+}
+
+func resolveProjectID(ctx context.Context, org, projectName string, timeoutSec int) (string, string, *ToolError) {
+	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "project", "list", "-org="+org, "-output=json")
+	if ferr != nil {
+		return "", "", ferr
+	}
+	var projects []map[string]any
+	if err := json.Unmarshal(raw, &projects); err != nil {
+		return "", "", &ToolError{ErrorCode: "execution_error", Message: "parse project list: " + err.Error()}
+	}
+	needle := strings.ToLower(projectName)
+	for _, p := range projects {
+		if n, ok := p["Name"].(string); ok && strings.ToLower(n) == needle {
+			if id, ok := p["ID"].(string); ok {
+				return id, n, nil
+			}
+		}
+	}
+	return "", "", &ToolError{ErrorCode: "not_found", Message: fmt.Sprintf("project %q not found in org %q", projectName, org), Retryable: false}
 }
 
 func workspaceDiffCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
@@ -2766,6 +3111,36 @@ func Definitions() []ToolDef {
 					"comment": map[string]any{"type": "string", "description": "Comment recorded on the discard"},
 				},
 				"required": []string{"run_id", "comment"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_workspace_create",
+			Description: "Creates a new HCP Terraform workspace in an organization, optionally within a named project. Returns { workspace_id, name, org, project, url }. Mutating — only available when --apply is set. The caller must obtain explicit user approval before calling this tool.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":               map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"name":              map[string]any{"type": "string", "description": "Name of the workspace to create"},
+					"project":           map[string]any{"type": "string", "description": "Optional project name to place the workspace in. Resolved to a project_id automatically."},
+					"project_id":        map[string]any{"type": "string", "description": "Optional project ID (prj-xxx). Overrides project when both are set."},
+					"description":       map[string]any{"type": "string", "description": "Optional human description for the workspace"},
+					"terraform_version": map[string]any{"type": "string", "description": "Optional Terraform version constraint, e.g. \"~>1.0\""},
+				},
+				"required": []string{"org", "name"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_workspace_populate",
+			Description: "Uploads Terraform HCL configuration to a workspace and triggers a run in one step. Writes the config string to a temp directory, creates a configuration version, uploads the files, and creates a run. Returns { run_id, status, workspace, terraform_init, message }. The caller should generate and self-validate HCL with _hcp_tf_config_validate before calling this tool. Mutating — only available when --apply is set.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Target workspace name (must already exist — use _hcp_tf_workspace_create first if needed)"},
+					"config":    map[string]any{"type": "string", "description": "Full Terraform HCL as a single string. The tool writes it to main.tf inside a temp directory and uploads the directory."},
+					"message":   map[string]any{"type": "string", "description": "Optional run message (default: \"tfpilot: initial resource provisioning\")"},
+				},
+				"required": []string{"org", "workspace", "config"},
 			},
 		},
 		{
