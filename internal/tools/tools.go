@@ -2104,6 +2104,22 @@ func versionUpgradeCall(ctx context.Context, args map[string]string, timeoutSec 
 	workspace := args["workspace"]
 	targetVersion := args["target_version"]
 
+	wsRaw, ferr := fetchWorkspaceRead(ctx, org, workspace, timeoutSec)
+	if ferr != nil {
+		result.Err = ferr
+		result.Duration = time.Since(start)
+		return result
+	}
+	if mode := extractWorkspaceExecutionMode(wsRaw); mode == "local" {
+		result.Err = &ToolError{
+			ErrorCode: "unsupported_operation",
+			Message:   fmt.Sprintf("Workspace %s is in local execution mode and cannot accept remote runs. Switch to remote execution in the HCP Terraform workspace settings and try again.", workspace),
+			Retryable: false,
+		}
+		result.Duration = time.Since(start)
+		return result
+	}
+
 	hcl := fmt.Sprintf("terraform {\n  required_version = \"~> %s\"\n}\n", targetVersion)
 
 	populateArgs := map[string]string{
@@ -2621,6 +2637,28 @@ func extractWorkspaceID(raw []byte) string {
 	if attrs, ok := m["attributes"].(map[string]any); ok {
 		if id := firstStringField(attrs, "id", "ID"); id != "" {
 			return id
+		}
+	}
+	return ""
+}
+
+// extractWorkspaceExecutionMode pulls the execution mode ("remote", "local",
+// "agent") out of a `hcptf workspace read -output=json` payload. Probes both
+// Go-mapped and JSON:API shapes; returns "" on miss.
+func extractWorkspaceExecutionMode(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return ""
+	}
+	if v := firstStringField(m, "ExecutionMode", "execution_mode", "execution-mode"); v != "" {
+		return v
+	}
+	if attrs, ok := m["attributes"].(map[string]any); ok {
+		if v := firstStringField(attrs, "execution-mode", "execution_mode", "ExecutionMode"); v != "" {
+			return v
 		}
 	}
 	return ""

@@ -1894,6 +1894,21 @@ func describeAction(name string, args map[string]string) string {
 			return fmt.Sprintf("upload config and trigger a run in %s", ws)
 		}
 		return "upload config and trigger a run"
+	case "_hcp_tf_version_upgrade":
+		ws := args["workspace"]
+		ver := args["target_version"]
+		if ws != "" && ver != "" {
+			return fmt.Sprintf("upgrade workspace %s to Terraform %s", ws, ver)
+		}
+		if ws != "" {
+			return fmt.Sprintf("upgrade workspace %s", ws)
+		}
+		return "upgrade Terraform version"
+	case "_hcp_tf_rollback":
+		if ws := args["workspace"]; ws != "" {
+			return fmt.Sprintf("revert workspace %s to the previous run", ws)
+		}
+		return "revert workspace to the previous run"
 	}
 	return "perform a mutation"
 }
