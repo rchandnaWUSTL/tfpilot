@@ -2142,13 +2142,25 @@ func versionUpgradeCall(ctx context.Context, args map[string]string, timeoutSec 
 		return result
 	}
 
+	runID, _ := inner["run_id"].(string)
 	out := map[string]any{
 		"org":            org,
 		"workspace":      workspace,
 		"target_version": targetVersion,
 		"run_id":         inner["run_id"],
-		"status":         inner["status"],
-		"message":        "Version bump config uploaded and plan triggered. Call _hcp_tf_plan_analyze with this run_id to assess risk before applying.",
+	}
+	// HCP Terraform auto-finalizes plans with 0 changes into planned_and_finished,
+	// which the apply gate cannot transition out of. checkRollbackNoop is generic
+	// (polls run/show for the same terminal status) — reuse it so we flag no-op
+	// upgrades before the agent walks the user into an apply trap.
+	if runID != "" && checkRollbackNoop(ctx, runID, timeoutSec) {
+		out["status"] = "planned_and_finished"
+		out["is_noop"] = true
+		out["message"] = fmt.Sprintf("Terraform version constraint ~> %s uploaded; the plan finished with no infrastructure changes. The version bump is complete — no apply needed.", targetVersion)
+	} else {
+		out["status"] = inner["status"]
+		out["is_noop"] = false
+		out["message"] = "Version bump config uploaded and plan triggered. Call _hcp_tf_plan_analyze with this run_id to assess risk before applying."
 	}
 	encoded, merr := json.Marshal(out)
 	if merr != nil {
