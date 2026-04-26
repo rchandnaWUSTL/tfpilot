@@ -506,6 +506,21 @@ func runDiagnoseCall(ctx context.Context, args map[string]string, timeoutSec int
 	return result
 }
 
+// FetchRunStatus reads the run's current status via `hcptf run read`. The
+// REPL's apply gate uses this to short-circuit when the run is already
+// finalized (e.g., planned_and_finished) — applying such a run would return
+// a "transition not allowed" error from HCP Terraform.
+func FetchRunStatus(ctx context.Context, runID string, timeoutSec int) (string, *ToolError) {
+	if runID == "" {
+		return "", &ToolError{ErrorCode: "invalid_tool", Message: "run_id is required"}
+	}
+	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "run", "read", "-id="+runID, "-output=json")
+	if ferr != nil {
+		return "", ferr
+	}
+	return decodeRunStatus(raw), nil
+}
+
 // decodeRunStatus pulls the status field out of a `hcptf run read` JSON blob.
 // Returns empty string when the payload is missing or the field is absent.
 func decodeRunStatus(raw []byte) string {
@@ -4802,7 +4817,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_rollback",
-			Description: "Reverts a workspace to a previous configuration by creating a new run against the previous applied run's configuration version. When `run_id` is omitted, picks the most recent `applied` run other than the current one. The new run is queued plan-only (auto-apply=false) — the agent must call _hcp_tf_plan_analyze on the resulting run, surface blast radius, and let the user approve via _hcp_tf_run_apply. Returns { workspace, rolled_back_to_run_id, rolled_back_to_created_at, rolled_back_to_human, new_run_id, status, next_step }. Mutating — requires --apply mode.",
+			Description: "Reverts a workspace to a previous configuration by creating a new run against the previous applied run's configuration version. When `run_id` is omitted, picks the most recent `applied` run other than the current one. The new run is queued for manual apply (auto-apply=false) and reaches `planned` status — the agent must call _hcp_tf_plan_analyze on the resulting run, surface blast radius, and let the user approve via _hcp_tf_run_apply. Returns { workspace, rolled_back_to_run_id, rolled_back_to_created_at, rolled_back_to_human, new_run_id, status, next_step }. Mutating — requires --apply mode.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

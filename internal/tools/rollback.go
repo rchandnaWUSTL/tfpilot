@@ -102,7 +102,7 @@ func rollbackCall(ctx context.Context, args map[string]string, timeoutSec int) *
 		"rolled_back_to_human":       humanRelative(parseTimeOrZero(targetCreatedAt)),
 		"new_run_id":                 newRunID,
 		"status":                     "queued",
-		"next_step":                  "Call _hcp_tf_plan_analyze on the new run, surface blast radius, then _hcp_tf_run_apply to commit.",
+		"next_step":                  "Call _hcp_tf_plan_analyze with run_id to assess blast radius, then call _hcp_tf_run_apply to complete the rollback after user confirms.",
 	}
 	out, mErr := json.Marshal(payload)
 	if mErr != nil {
@@ -229,9 +229,11 @@ func fetchRunConfigVersionID(ctx context.Context, token, runID string, timeoutSe
 }
 
 // createRollbackRun POSTs /api/v2/runs with the previous configuration
-// version. Returns the new run's ID. The run is queued plan-only-or-apply
-// (auto-apply=false) so the user must explicitly approve via the existing
-// _hcp_tf_run_apply gate.
+// version. Returns the new run's ID. The run is queued for manual apply
+// (plan-only=false, auto-apply=false) so it reaches `planned` and waits for
+// the user to approve via the existing _hcp_tf_run_apply gate — sending
+// plan-only=true here would land the run in `planned_and_finished` and HCP
+// Terraform would reject any apply with a transition error.
 func createRollbackRun(ctx context.Context, token, wsID, cvID, sourceRunID string, timeoutSec int) (string, *ToolError) {
 	body := map[string]any{
 		"data": map[string]any{

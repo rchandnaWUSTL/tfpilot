@@ -320,12 +320,35 @@ func (r *REPL) approveMutation(name string, args map[string]string) bool {
 	return approved
 }
 
+// runStatusAppliable reports whether the run is in a state that HCP Terraform
+// will accept an apply transition from. Statuses like planned_and_finished,
+// errored, discarded, and canceled are terminal — applying them returns a
+// "transition not allowed" error from the platform. An empty status is
+// treated as appliable so a transient `run read` failure doesn't block the
+// gate; the legacy analyze path will then surface the underlying problem.
+func runStatusAppliable(status string) bool {
+	switch status {
+	case "planned_and_finished", "errored", "discarded", "canceled":
+		return false
+	}
+	return true
+}
+
 // applyGate runs _hcp_tf_plan_analyze, renders the risk assessment, and
 // prompts for confirmation with a strength scaled to the returned risk level.
 // When analyze fails, it falls back to the legacy destroys-based gate so the
 // REPL is still safe against network or permission errors on the analyze call.
 func (r *REPL) applyGate(args map[string]string) bool {
 	runID := args["run_id"]
+
+	sctx, scancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	status, statusErr := tools.FetchRunStatus(sctx, runID, r.cfg.TimeoutSeconds)
+	scancel()
+	if statusErr == nil && !runStatusAppliable(status) {
+		fmt.Println()
+		boundaryPink.Printf("  ✗ This run is in '%s' state and cannot be applied. The rollback tool may have created it incorrectly — please retry the rollback.\n", status)
+		return false
+	}
 
 	analyzeArgs := map[string]string{
 		"org":       r.org,
