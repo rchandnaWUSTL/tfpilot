@@ -161,6 +161,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleAudit()
 	case "/modules":
 		r.handleModules()
+	case "/providers":
+		r.handleProviders()
 	case "/workspaces":
 		r.handleWorkspaces(parts[1:])
 	default:
@@ -854,6 +856,118 @@ func (r *REPL) handleModules() {
 	if len(payload.UnknownModules) > 0 {
 		vaultYellow.Println("  Unknown modules (not in registry map):")
 		for _, u := range payload.UnknownModules {
+			fmt.Printf("    • %s\n", u)
+		}
+		fmt.Println()
+	}
+
+	dimWhite.Printf("  Note: %s\n", payload.Note)
+	fmt.Println()
+}
+
+// handleProviders implements /providers by calling _hcp_tf_provider_audit for
+// the pinned org+workspace. Providers detected in the workspace's state (or
+// resource addresses if state download fails) are listed with the latest
+// registry version and any known CVEs from OSV.dev. Pinned versions are
+// labelled unknown because the API doesn't expose .terraform.lock.hcl.
+func (r *REPL) handleProviders() {
+	if r.org == "" {
+		boundaryPink.Println("Set an org first with /org <name>")
+		return
+	}
+	if r.workspace == "" {
+		boundaryPink.Println("Set a workspace first with /workspace <name>")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	result := tools.Call(ctx, "_hcp_tf_provider_audit",
+		map[string]string{"org": r.org, "workspace": r.workspace},
+		r.cfg.TimeoutSeconds,
+	)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_provider_audit: %s\n", result.Err.Message)
+		return
+	}
+
+	type cveRow struct {
+		ID       string `json:"id"`
+		Summary  string `json:"summary"`
+		Severity string `json:"severity"`
+		FixedIn  string `json:"fixed_in"`
+	}
+	type providerRow struct {
+		Name           string   `json:"name"`
+		Namespace      string   `json:"namespace"`
+		RegistryPath   string   `json:"registry_path"`
+		PinnedVersion  string   `json:"pinned_version"`
+		LatestVersion  string   `json:"latest_version"`
+		VersionsBehind string   `json:"versions_behind"`
+		KnownCVEs      []cveRow `json:"known_cves"`
+		CVECount       int      `json:"cve_count"`
+		Status         string   `json:"status"`
+		UpgradeNote    string   `json:"upgrade_note"`
+	}
+	var payload struct {
+		Org                      string        `json:"org"`
+		Workspace                string        `json:"workspace"`
+		ProviderVersionAvailable bool          `json:"provider_version_available"`
+		Providers                []providerRow `json:"providers"`
+		UnknownProviders         []string      `json:"unknown_providers"`
+		CVEDataUnavailable       bool          `json:"cve_data_unavailable"`
+		StateDownloadFailed      bool          `json:"state_download_failed"`
+		Note                     string        `json:"note"`
+	}
+	if err := json.Unmarshal(result.Output, &payload); err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_provider_audit: could not parse output: %v\n", err)
+		return
+	}
+
+	bold.Printf("  Provider Audit — %s\n", payload.Workspace)
+	fmt.Println()
+	dimWhite.Printf("  %d providers detected.\n", len(payload.Providers))
+	dimWhite.Println("  Note: Pinned versions unavailable — compare against your .terraform.lock.hcl.")
+	if payload.StateDownloadFailed {
+		vaultYellow.Println("  State download failed — providers extracted from resource addresses.")
+	}
+	if payload.CVEDataUnavailable {
+		vaultYellow.Println("  CVE data unavailable — OSV.dev unreachable. Showing providers and latest versions only.")
+	}
+	fmt.Println()
+
+	for _, p := range payload.Providers {
+		header := fmt.Sprintf("  • %s    latest: %s    %d CVEs\n", p.RegistryPath, p.LatestVersion, p.CVECount)
+		if p.CVECount > 0 {
+			boundaryPink.Print(header)
+		} else {
+			waypointTeal.Print(header)
+		}
+		for _, c := range p.KnownCVEs {
+			fix := ""
+			if c.FixedIn != "" {
+				fix = fmt.Sprintf(" (fixed in %s)", c.FixedIn)
+			}
+			line := fmt.Sprintf("    %s (%s)%s — %s\n", c.ID, c.Severity, fix, c.Summary)
+			switch c.Severity {
+			case "critical", "high":
+				boundaryPink.Print(line)
+			case "medium":
+				vaultYellow.Print(line)
+			default:
+				dimWhite.Print(line)
+			}
+		}
+		dimWhite.Printf("    Upgrade note: %s\n", p.UpgradeNote)
+		fmt.Println()
+	}
+
+	if len(payload.UnknownProviders) > 0 {
+		vaultYellow.Println("  Unknown providers (non-hashicorp namespace):")
+		for _, u := range payload.UnknownProviders {
 			fmt.Printf("    • %s\n", u)
 		}
 		fmt.Println()
@@ -1587,6 +1701,7 @@ func printHelp() {
 	fmt.Println("  /stacks            List Terraform Stacks in the pinned org")
 	fmt.Println("  /audit             Terraform version + CVE audit across all workspaces")
 	fmt.Println("  /modules           Per-workspace module version report from the Terraform Registry")
+	fmt.Println("  /providers         Per-workspace provider CVE and version report")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")

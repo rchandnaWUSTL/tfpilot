@@ -1492,6 +1492,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_module_audit" {
 		return moduleAuditCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_provider_audit" {
+		return providerAuditCall(ctx, args, timeoutSec)
+	}
 	if name == "_hcp_tf_stacks_list" {
 		return stacksListCall(ctx, args, timeoutSec)
 	}
@@ -3169,6 +3172,420 @@ func moduleAuditCall(ctx context.Context, args map[string]string, timeoutSec int
 	return result
 }
 
+// providerAuditNote is appended to every _hcp_tf_provider_audit response so the
+// caller is reminded that pinned versions cannot be inferred from state and
+// that CVE data is sourced from OSV.dev.
+const providerAuditNote = "Provider versions are not available via the HCP Terraform API. Pinned versions require access to .terraform.lock.hcl. CVE data sourced from OSV.dev."
+
+// providerRef captures a single provider extracted from a workspace state or
+// resource list. Namespace and Name are decoded from the registry path; Raw is
+// the full provider address as it appeared in the source so we can surface
+// non-hashicorp providers verbatim under unknown_providers.
+type providerRef struct {
+	Raw       string
+	Namespace string
+	Name      string
+}
+
+// providerRegistryEntry mirrors the JSON shape of `hcptf publicregistry provider`.
+type providerRegistryEntry struct {
+	Name        string `json:"Name"`
+	Version     string `json:"Version"`
+	Description string `json:"Description"`
+	DocsURL     string `json:"DocsURL"`
+	Source      string `json:"Source"`
+}
+
+// parseProviderAddress decodes the per-resource provider field shape
+// `provider["registry.terraform.io/<ns>/<name>"]` (or the bare path with no
+// brackets) into a providerRef. Returns false when the address can't be
+// parsed; the caller should treat those as unknown_providers.
+func parseProviderAddress(addr string) (providerRef, bool) {
+	s := strings.TrimSpace(addr)
+	if s == "" {
+		return providerRef{}, false
+	}
+	// Strip the optional `provider["..."]` wrapper.
+	if strings.HasPrefix(s, "provider[") && strings.HasSuffix(s, "]") {
+		inner := s[len("provider["):len(s)-1]
+		inner = strings.Trim(inner, `"`)
+		s = inner
+	}
+	// Strip leading registry host so we can split on namespace/name.
+	for _, host := range []string{"registry.terraform.io/", "registry.opentofu.org/"} {
+		if strings.HasPrefix(s, host) {
+			s = strings.TrimPrefix(s, host)
+			break
+		}
+	}
+	parts := strings.Split(s, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return providerRef{Raw: addr}, false
+	}
+	return providerRef{Raw: addr, Namespace: parts[0], Name: parts[1]}, true
+}
+
+// extractProvidersFromStateJSON walks a downloaded state JSON and returns the
+// distinct provider references seen across all resources. Order is sorted by
+// namespace/name for stable output. Returns (refs, unknownAddresses, err).
+func extractProvidersFromStateJSON(raw []byte) ([]providerRef, []string, error) {
+	var state struct {
+		Resources []struct {
+			Provider string `json:"provider"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(raw, &state); err != nil {
+		return nil, nil, err
+	}
+	seen := map[string]providerRef{}
+	unknownSeen := map[string]struct{}{}
+	var unknown []string
+	for _, r := range state.Resources {
+		addr := strings.TrimSpace(r.Provider)
+		if addr == "" {
+			continue
+		}
+		ref, ok := parseProviderAddress(addr)
+		if !ok {
+			if _, dup := unknownSeen[addr]; !dup {
+				unknownSeen[addr] = struct{}{}
+				unknown = append(unknown, addr)
+			}
+			continue
+		}
+		key := ref.Namespace + "/" + ref.Name
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = ref
+	}
+	refs := make([]providerRef, 0, len(seen))
+	for _, v := range seen {
+		refs = append(refs, v)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Namespace != refs[j].Namespace {
+			return refs[i].Namespace < refs[j].Namespace
+		}
+		return refs[i].Name < refs[j].Name
+	})
+	sort.Strings(unknown)
+	return refs, unknown, nil
+}
+
+// extractProvidersFromResources is the fallback path when state download fails.
+// hcptf workspace resource list surfaces a "provider_name" field per resource
+// in the same provider["..."] format used inside state files.
+func extractProvidersFromResources(items []workspaceResource) ([]providerRef, []string) {
+	seen := map[string]providerRef{}
+	unknownSeen := map[string]struct{}{}
+	var unknown []string
+	for _, it := range items {
+		addr := strings.TrimSpace(it.Provider)
+		if addr == "" {
+			continue
+		}
+		ref, ok := parseProviderAddress(addr)
+		if !ok {
+			if _, dup := unknownSeen[addr]; !dup {
+				unknownSeen[addr] = struct{}{}
+				unknown = append(unknown, addr)
+			}
+			continue
+		}
+		key := ref.Namespace + "/" + ref.Name
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = ref
+	}
+	refs := make([]providerRef, 0, len(seen))
+	for _, v := range seen {
+		refs = append(refs, v)
+	}
+	sort.Slice(refs, func(i, j int) bool {
+		if refs[i].Namespace != refs[j].Namespace {
+			return refs[i].Namespace < refs[j].Namespace
+		}
+		return refs[i].Name < refs[j].Name
+	})
+	sort.Strings(unknown)
+	return refs, unknown
+}
+
+// fetchProviderRegistryEntry shells out to `hcptf publicregistry provider` for
+// a single namespace/name path and returns the parsed metadata or a sentinel
+// "unavailable" flag on any failure.
+func fetchProviderRegistryEntry(ctx context.Context, registryPath string, timeoutSec int) (*providerRegistryEntry, bool) {
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "hcptf", "publicregistry", "provider",
+		"-name="+registryPath,
+		"-output=json",
+	)
+	out, execErr := cmd.Output()
+	if execErr != nil {
+		return nil, true
+	}
+	if looksLikeHTML(string(out)) {
+		return nil, true
+	}
+	var entry providerRegistryEntry
+	if err := json.Unmarshal(out, &entry); err != nil {
+		return nil, true
+	}
+	if entry.Version == "" {
+		return nil, true
+	}
+	return &entry, false
+}
+
+// fetchOSVProviderAdvisories POSTs a provider package to OSV.dev /v1/query
+// without a version field — so the response surfaces every known CVE for the
+// package, framed as what an upgrade would address. Mirrors fetchOSVAdvisories
+// but with the provider package name and no version filter.
+func fetchOSVProviderAdvisories(ctx context.Context, providerShortName string, timeoutSec int) ([]advisoryEntry, bool) {
+	perQuery := 10 * time.Second
+	if d := time.Duration(timeoutSec) * time.Second; d > 0 && d < perQuery {
+		perQuery = d
+	}
+	cctx, cancel := context.WithTimeout(ctx, perQuery)
+	defer cancel()
+
+	pkgName := "github.com/hashicorp/terraform-provider-" + providerShortName
+	body := []byte(fmt.Sprintf(`{"package":{"name":%q,"ecosystem":"Go"}}`, pkgName))
+	req, err := http.NewRequestWithContext(cctx, http.MethodPost, "https://api.osv.dev/v1/query", bytes.NewReader(body))
+	if err != nil {
+		return nil, true
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "tfpilot/1.5")
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, true
+	}
+	defer resp.Body.Close()
+
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, true
+	}
+	if looksLikeHTML(string(raw)) {
+		return nil, true
+	}
+	entries, parseErr := parseOSVResponse(raw)
+	if parseErr {
+		return nil, true
+	}
+	return entries, false
+}
+
+// downloadWorkspaceState shells out to `hcptf state download` and returns the
+// raw state JSON bytes. Returns (nil, ferr) when the download fails — the
+// caller is responsible for falling back to resource-address extraction.
+func downloadWorkspaceState(ctx context.Context, org, workspace string, timeoutSec int) ([]byte, *ToolError) {
+	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(cctx, "hcptf", "state", "download",
+		"-org="+org,
+		"-workspace="+workspace,
+	)
+	out, execErr := cmd.Output()
+	if execErr != nil {
+		stderr := ""
+		if e, ok := execErr.(*exec.ExitError); ok {
+			stderr = strings.TrimSpace(string(e.Stderr))
+		}
+		if looksLikeHTML(string(out)) || looksLikeHTML(stderr) {
+			return nil, htmlGuardError()
+		}
+		msg := execErr.Error()
+		if stderr != "" {
+			msg = stderr
+		}
+		return nil, &ToolError{ErrorCode: "execution_error", Message: msg, Retryable: true}
+	}
+	if looksLikeHTML(string(out)) {
+		return nil, htmlGuardError()
+	}
+	return out, nil
+}
+
+// providerAuditCall extracts the providers used by a workspace, fetches the
+// latest version of each hashicorp provider from the public registry, and
+// queries OSV.dev for known CVEs per provider. Pinned versions are not
+// available without access to .terraform.lock.hcl, so every entry is labeled
+// "check_recommended" and the response carries a note explaining the limit.
+// Read-only.
+func providerAuditCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_provider_audit", Args: args}
+
+	if err := require(args, "org", "workspace"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	workspace := args["workspace"]
+
+	// Primary path: download state JSON and extract providers from it.
+	// Fallback: parse provider_name fields from `hcptf workspace resource list`
+	// when the state download fails (private S3 redirect, plan-tier gate, etc.).
+	var refs []providerRef
+	var unknown []string
+	stateDownloadFailed := false
+	stateRaw, dlErr := downloadWorkspaceState(ctx, org, workspace, timeoutSec)
+	if dlErr == nil {
+		parsed, unk, perr := extractProvidersFromStateJSON(stateRaw)
+		if perr != nil {
+			stateDownloadFailed = true
+		} else {
+			refs = parsed
+			unknown = unk
+		}
+	} else {
+		stateDownloadFailed = true
+	}
+	if stateDownloadFailed {
+		raw, fetchErr := fetchWorkspaceResources(ctx, org, workspace, timeoutSec)
+		if fetchErr != nil {
+			result.Err = fetchErr
+			result.Duration = time.Since(start)
+			return result
+		}
+		items, perr := unmarshalResources(raw)
+		if perr != nil {
+			result.Err = &ToolError{ErrorCode: "parse_error", Message: perr.Error()}
+			result.Duration = time.Since(start)
+			return result
+		}
+		refs, unknown = extractProvidersFromResources(items)
+	}
+
+	type knownProvider struct {
+		ref          providerRef
+		registryPath string
+	}
+	var known []knownProvider
+	for _, r := range refs {
+		if r.Namespace != "hashicorp" {
+			unknown = append(unknown, r.Raw)
+			continue
+		}
+		known = append(known, knownProvider{ref: r, registryPath: r.Namespace + "/" + r.Name})
+	}
+	sort.Strings(unknown)
+
+	// Fan out registry + OSV lookups with bounded concurrency.
+	type fetched struct {
+		idx     int
+		entry   *providerRegistryEntry
+		regBad  bool
+		cves    []advisoryEntry
+		cveBad  bool
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	results := make([]fetched, 0, len(known))
+	for i, k := range known {
+		wg.Add(1)
+		go func(idx int, kp knownProvider) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			entry, regBad := fetchProviderRegistryEntry(ctx, kp.registryPath, timeoutSec)
+			cves, cveBad := fetchOSVProviderAdvisories(ctx, kp.ref.Name, timeoutSec)
+			mu.Lock()
+			results = append(results, fetched{idx: idx, entry: entry, regBad: regBad, cves: cves, cveBad: cveBad})
+			mu.Unlock()
+		}(i, k)
+	}
+	wg.Wait()
+	idxToFetched := make(map[int]fetched, len(results))
+	cveDataUnavailable := false
+	for _, r := range results {
+		idxToFetched[r.idx] = r
+		if r.cveBad {
+			cveDataUnavailable = true
+		}
+	}
+
+	type providerEntry struct {
+		Name           string          `json:"name"`
+		Namespace      string          `json:"namespace"`
+		RegistryPath   string          `json:"registry_path"`
+		PinnedVersion  string          `json:"pinned_version"`
+		LatestVersion  string          `json:"latest_version"`
+		VersionsBehind string          `json:"versions_behind"`
+		KnownCVEs      []advisoryEntry `json:"known_cves"`
+		CVECount       int             `json:"cve_count"`
+		Status         string          `json:"status"`
+		UpgradeNote    string          `json:"upgrade_note"`
+	}
+	entries := make([]providerEntry, 0, len(known))
+	for i, k := range known {
+		f := idxToFetched[i]
+		latest := "unavailable"
+		if !f.regBad && f.entry != nil {
+			latest = f.entry.Version
+		}
+		cves := f.cves
+		if cves == nil {
+			cves = []advisoryEntry{}
+		}
+		var note string
+		switch {
+		case latest == "unavailable":
+			note = "Could not determine latest version from the registry."
+		case len(cves) > 0:
+			note = fmt.Sprintf("Upgrading to %s would address %d known CVEs.", latest, len(cves))
+		default:
+			note = fmt.Sprintf("No known CVEs found for this provider. Upgrading to %s is still recommended to stay current.", latest)
+		}
+		entries = append(entries, providerEntry{
+			Name:           k.ref.Name,
+			Namespace:      k.ref.Namespace,
+			RegistryPath:   k.registryPath,
+			PinnedVersion:  "unknown",
+			LatestVersion:  latest,
+			VersionsBehind: "unknown",
+			KnownCVEs:      cves,
+			CVECount:       len(cves),
+			Status:         "check_recommended",
+			UpgradeNote:    note,
+		})
+	}
+
+	if unknown == nil {
+		unknown = []string{}
+	}
+
+	payload := map[string]any{
+		"org":                        org,
+		"workspace":                  workspace,
+		"provider_version_available": false,
+		"providers":                  entries,
+		"unknown_providers":          unknown,
+		"cve_data_unavailable":       cveDataUnavailable,
+		"state_download_failed":      stateDownloadFailed,
+		"note":                       providerAuditNote,
+	}
+
+	body, mErr := json.Marshal(payload)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(body)
+	result.Duration = time.Since(start)
+	return result
+}
+
 // normalizeTerraformVersion strips constraint prefixes and the leading "v" so
 // values like "~>1.14.0", ">= 1.5.0", or "v1.5.0" become "1.14.0" / "1.5.0".
 // hcptf surfaces both pinned versions and Terraform CLI constraint operators
@@ -4013,6 +4430,18 @@ func Definitions() []ToolDef {
 		{
 			Name:        "_hcp_tf_module_audit",
 			Description: "Infers which Terraform Registry modules a workspace uses by examining its resource addresses, then queries the public registry (`hcptf publicregistry module`) for the latest available version of each known module. Pinned versions are not available without access to the workspace's .tf files, so every entry is labeled `pinned_version: unknown` and `status: check_recommended`. Module names not present in the built-in registry map are surfaced separately under `unknown_modules`. Read-only; degrades to `latest_version: unavailable` when an individual registry call fails.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name"},
+				},
+				"required": []string{"org", "workspace"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_provider_audit",
+			Description: "Audits Terraform providers in a workspace. Downloads the workspace's state JSON via `hcptf state download` to extract provider names; falls back to per-resource provider fields when state download fails. For each `hashicorp/*` provider, fetches the latest version from the public registry and queries OSV.dev for known CVEs. Pinned versions are not available without access to `.terraform.lock.hcl`, so every entry is labeled `pinned_version: unknown` and `status: check_recommended`. CVE lookups omit a version field, so the response surfaces every known CVE for the provider — framed as what an upgrade would address. Non-hashicorp providers are surfaced separately under `unknown_providers`. Read-only; degrades to `cve_data_unavailable: true` when OSV is unreachable.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
