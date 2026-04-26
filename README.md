@@ -67,6 +67,7 @@ export ANTHROPIC_API_KEY=your-key
 - Org-wide Terraform version audit with CVE checking — groups workspaces by version, flags known vulnerabilities (sourced from OSV.dev), scores upgrade complexity
 - Per-workspace module audit — infers Terraform Registry modules from a workspace's resource addresses and surfaces the latest available versions from the public registry
 - Per-workspace provider audit — extracts provider names from workspace state, surfaces latest versions from the public registry, and lists known CVEs from OSV.dev with upgrade notes
+- Safe upgrade preview — generates a speculative plan against the local HCL with a bumped provider version constraint, then synthesizes the speculative plan's risk and blast radius, the CVE delta closed by the upgrade, and breaking changes parsed from upstream GitHub release notes into a concrete go / review / no-go recommendation. Available via the agent ("is it safe to upgrade aws to 5.91.0?") or the `/upgrade <provider> <version>` slash command. Requires `--apply` mode; the speculative run is discarded after analysis.
 
 ---
 

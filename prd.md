@@ -168,6 +168,7 @@ A long-running REPL process that renders the conversation:
 | `_hcp_tf_run_discard` | Discards a pending run so it cannot be applied |
 | `_hcp_tf_workspace_create` | Creates a new workspace in an org, optionally inside a named project. Returns `{ workspace_id, name, org, project, url }`. |
 | `_hcp_tf_workspace_populate` | Writes an HCL string to a temp dir, uploads a configuration version to the archivist, and triggers a run in one call. Returns `{ run_id, status, workspace, terraform_init }`. |
+| `_hcp_tf_upgrade_preview` | Generates a what-if speculative plan for a provider upgrade. Stages local HCL into a tempdir, rewrites the named provider's `version` constraint to `= <target_version>`, uploads as a speculative configuration version, polls for the auto-queued plan-only run, and feeds it through `_hcp_tf_plan_analyze`. Cross-references CVEs from `_hcp_tf_provider_audit` and pulls breaking changes from upstream GitHub release notes. Discards the speculative run after analysis. Returns `{ from_version, target_version, risk_level, blast_radius, cves_fixed, breaking_changes, recommendation, recommendation_reason }`. Mutating because it creates a configversion (the run itself never applies). |
 
 ### Config generation tools (always available)
 

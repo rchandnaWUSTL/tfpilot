@@ -148,12 +148,23 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Graceful degradation: version audit still returns groupings if OSV.dev is unreachable; module audit degrades to `latest_version: unavailable` per module on registry failures; provider audit falls back to resource-address provider extraction when state download fails, degrades `pinned_version_source` to `unknown` when plan export is unavailable, and sets `cve_data_unavailable: true` when OSV is unreachable. Plan exports are best-effort cleaned up after the audit; a stale export on the next run is recovered via the TFC JSON API.
 - Full upgrade-effort scoring deferred to v1.5.1
 
-## v1.6 — Plan Analyzer v2
+## v1.6 — Safe Upgrade Preview (In Progress)
+- _hcp_tf_upgrade_preview tool: generates a what-if speculative plan by staging the workspace's local HCL into a tempdir, rewriting the named provider's version constraint to `= <target_version>`, uploading the result as a speculative configuration version, and waiting for the auto-queued plan-only run to reach a terminal state. Mutating — requires --apply, REPL-gated, speculative run is discarded after analysis.
+- Feeds the speculative run through _hcp_tf_plan_analyze for the same risk_level / blast_radius / risk_factors output a normal plan would produce — the upgrade is judged against the workspace's actual resources, not a generic checklist.
+- Cross-references _hcp_tf_provider_audit's `upgrading_fixes` set and partitions it into `cves_fixed` for the chosen target_version: a CVE is counted as fixed only when its `fixed_in` is at or below the target.
+- Fetches GitHub release notes between the pinned and target versions from `https://api.github.com/repos/hashicorp/terraform-provider-<name>/releases`. Parses explicit `BREAKING CHANGES:` sections first; falls back to a keyword scan (breaking, removed, deprecated, no longer, must now). Honors GITHUB_TOKEN for higher API rate limits; degrades `breaking_changes_source` to `unavailable` or `rate_limited` rather than failing the tool.
+- Synthesizes a single `recommendation` (go|review|no_go) from the four signals: Critical risk → no_go; breaking change that touches a resource type in the plan's blast radius → no_go; High risk or any breaking changes present or unknown pinned version → review; Low/Medium with no breaking changes and at least one CVE closed → go. Returns `recommendation_reason` in plain English citing which signal drove the call.
+- /upgrade <provider> <version> slash command: bypasses the agent path, calls the tool directly, and pretty-prints risk + blast radius + CVE fix list + breaking changes + recommendation using the existing color helpers. Refuses in readonly mode with a clear "use --apply" message.
+- System prompt rule: when the user asks "is it safe to upgrade …", the agent calls _hcp_tf_upgrade_preview; if no target_version is given, it chains through _hcp_tf_provider_audit first to discover latest_version. Generic upgrade advice is explicitly forbidden.
+- Resolves Issue 3 from the post-v1.5 audit: "is it safe to upgrade?" returns a real risk score, blast radius, CVE diff, and breaking-changes summary grounded in the user's workspace, never generic advice.
+- Constraint: the workspace's HCL must be in the tool's `config_path` (defaults to cwd). VCS-only workspaces and configurations the user does not have locally surface an `unsupported_operation` error explaining the requirement.
+
+## v1.7 — Plan Analyzer v2
 - `how_to_reduce_risk` field per risk factor: concrete, actionable suggestions for making a High or Critical plan safer before applying
 - Registry integration for module version context: surfaces whether a module version in the plan has known issues or a newer release
 - Risk factor explanations written for the operator, not just the model — readable in the REPL without post-processing
 
-## v1.7 — Observability and Metrics
+## v1.8 — Observability and Metrics
 - Usage analytics: sessions per workspace, tool call frequency, apply success rates
 - Audit log visualization: searchable, filterable view of ~/.tfpilot/audit.log entries
 - Agent call patterns: which tools are invoked together, which prompts lead to applies vs. read-only sessions

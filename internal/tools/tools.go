@@ -29,6 +29,7 @@ var MutatingTools = map[string]bool{
 	"_hcp_tf_run_discard":        true,
 	"_hcp_tf_workspace_create":   true,
 	"_hcp_tf_workspace_populate": true,
+	"_hcp_tf_upgrade_preview":    true,
 }
 
 // IsMutating reports whether a tool name triggers state changes.
@@ -1509,6 +1510,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	}
 	if name == "_hcp_tf_workspace_populate" {
 		return workspacePopulateCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_upgrade_preview" {
+		return upgradePreviewCall(ctx, args, timeoutSec)
 	}
 
 	start := time.Now()
@@ -5025,6 +5029,21 @@ func Definitions() []ToolDef {
 					"message":   map[string]any{"type": "string", "description": "Optional run message (default: \"tfpilot: initial resource provisioning\")"},
 				},
 				"required": []string{"org", "workspace", "config"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_upgrade_preview",
+			Description: "Previews the safety of upgrading a provider in a workspace. Generates a speculative plan by uploading the local HCL config (with the named provider's version constraint rewritten to `= <target_version>`) as a speculative configuration version, polls for the auto-queued plan-only run, and feeds it through `_hcp_tf_plan_analyze` for risk_level and blast_radius. Cross-references CVEs from `_hcp_tf_provider_audit` to compute `cves_fixed`, fetches GitHub release notes between the pinned and target versions to extract `breaking_changes`, and synthesizes a `recommendation` (go|review|no_go). The speculative run is discarded after analysis. Mutating — only available when --apply is set; the speculative run never applies but a configversion is created. The tool reads HCL from `config_path` (defaults to the current working directory). Honors GITHUB_TOKEN for higher GitHub API rate limits.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":            map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace":      map[string]any{"type": "string", "description": "Workspace name"},
+					"provider":       map[string]any{"type": "string", "description": "Provider short name as it appears in `required_providers` (e.g. \"aws\", \"google\", \"azurerm\")"},
+					"target_version": map[string]any{"type": "string", "description": "Target provider version (e.g. \"5.91.0\"). If omitted, call _hcp_tf_provider_audit first to discover latest_version."},
+					"config_path":    map[string]any{"type": "string", "description": "Optional path to a directory containing the workspace's HCL. Defaults to the current working directory. The tool will rewrite the provider's version constraint and upload as a speculative configversion."},
+				},
+				"required": []string{"org", "workspace", "provider", "target_version"},
 			},
 		},
 		{

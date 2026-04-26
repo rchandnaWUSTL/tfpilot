@@ -163,6 +163,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleModules()
 	case "/providers":
 		r.handleProviders()
+	case "/upgrade":
+		r.handleUpgrade(parts[1:])
 	case "/workspaces":
 		r.handleWorkspaces(parts[1:])
 	default:
@@ -1035,6 +1037,167 @@ func (r *REPL) handleProviders() {
 	fmt.Println()
 }
 
+// handleUpgrade implements /upgrade <provider> <version> by calling
+// _hcp_tf_upgrade_preview directly (bypassing the agent path) and
+// pretty-printing the synthesized go/review/no_go recommendation along with
+// the four signal sources: speculative-plan risk + blast radius, CVE diff,
+// breaking changes from GitHub release notes, and recommendation reason.
+//
+// Because the underlying tool is mutating (it creates a speculative
+// configuration version even though the resulting run never applies), this
+// handler:
+//   - refuses to run in readonly mode with a clear "use --apply" message
+//   - calls r.approveMutation first to mirror the agent-path approval gate
+func (r *REPL) handleUpgrade(args []string) {
+	if r.cfg.Readonly {
+		boundaryPink.Println("/upgrade requires --apply mode (it creates a speculative configuration version).")
+		return
+	}
+	if len(args) < 2 {
+		boundaryPink.Println("Usage: /upgrade <provider> <version>")
+		dimWhite.Println("  Example: /upgrade aws 5.91.0")
+		return
+	}
+	if r.org == "" || r.workspace == "" {
+		boundaryPink.Println("Set /org and /workspace before running /upgrade.")
+		return
+	}
+	provider := strings.TrimSpace(args[0])
+	target := strings.TrimPrefix(strings.TrimSpace(args[1]), "v")
+
+	toolArgs := map[string]string{
+		"org":            r.org,
+		"workspace":      r.workspace,
+		"provider":       provider,
+		"target_version": target,
+	}
+	if !r.approveMutation("_hcp_tf_upgrade_preview", toolArgs) {
+		return
+	}
+
+	// Speculative plan + GitHub fetch + analyze can take a couple of minutes
+	// in the worst case (queue + plan + release-notes pagination). Use a
+	// generous outer deadline; the tool itself enforces a 5-minute internal
+	// poll deadline for the speculative run.
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	defer cancel()
+
+	fmt.Println()
+	dimWhite.Printf("  Generating speculative plan for %s upgrade to %s...\n", provider, target)
+	result := tools.Call(ctx, "_hcp_tf_upgrade_preview", toolArgs, r.cfg.TimeoutSeconds)
+
+	fmt.Println()
+	if result.Err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_upgrade_preview: %s\n", result.Err.Message)
+		return
+	}
+
+	type cveRow struct {
+		ID       string `json:"id"`
+		Summary  string `json:"summary"`
+		Severity string `json:"severity"`
+		FixedIn  string `json:"fixed_in"`
+	}
+	type blastRow struct {
+		Total        int `json:"total_resources_affected"`
+		Additions    int `json:"additions"`
+		Changes      int `json:"changes"`
+		Destructions int `json:"destructions"`
+	}
+	var payload struct {
+		Workspace             string   `json:"workspace"`
+		Provider              string   `json:"provider"`
+		FromVersion           string   `json:"from_version"`
+		FromVersionSource     string   `json:"from_version_source"`
+		TargetVersion         string   `json:"target_version"`
+		SpeculativeRunID      string   `json:"speculative_run_id"`
+		RiskLevel             string   `json:"risk_level"`
+		BlastRadius           blastRow `json:"blast_radius"`
+		CVEsFixed             []cveRow `json:"cves_fixed"`
+		BreakingChanges       []string `json:"breaking_changes"`
+		BreakingChangesSource string   `json:"breaking_changes_source"`
+		Recommendation        string   `json:"recommendation"`
+		RecommendationReason  string   `json:"recommendation_reason"`
+	}
+	if err := json.Unmarshal(result.Output, &payload); err != nil {
+		boundaryPink.Printf("  ✗ _hcp_tf_upgrade_preview: could not parse output: %v\n", err)
+		return
+	}
+
+	tfPurple.Printf("  Upgrade Preview — %s: %s → %s\n", payload.Workspace, payload.Provider, payload.TargetVersion)
+	fmt.Println()
+
+	riskIcon := "✓"
+	switch strings.ToLower(payload.RiskLevel) {
+	case "critical":
+		boundaryPink.Printf("  Risk Level: %s ✗\n", strings.ToUpper(payload.RiskLevel))
+	case "high":
+		vaultYellow.Printf("  Risk Level: %s ⚠\n", strings.ToUpper(payload.RiskLevel))
+	default:
+		waypointTeal.Printf("  Risk Level: %s %s\n", strings.ToUpper(payload.RiskLevel), riskIcon)
+	}
+	fmt.Println()
+
+	dimWhite.Printf("  Blast Radius: %d resource(s) affected (%d destruction%s, %d addition%s, %d change%s)\n",
+		payload.BlastRadius.Total,
+		payload.BlastRadius.Destructions, plural(payload.BlastRadius.Destructions),
+		payload.BlastRadius.Additions, plural(payload.BlastRadius.Additions),
+		payload.BlastRadius.Changes, plural(payload.BlastRadius.Changes),
+	)
+	fmt.Println()
+
+	if len(payload.CVEsFixed) > 0 {
+		waypointTeal.Printf("  CVEs fixed by upgrading to %s:\n", payload.TargetVersion)
+		for _, c := range payload.CVEsFixed {
+			fix := ""
+			if c.FixedIn != "" {
+				fix = fmt.Sprintf(" — fixed in %s", c.FixedIn)
+			}
+			line := fmt.Sprintf("    ✓ %s (%s)%s — %s\n", c.ID, c.Severity, fix, c.Summary)
+			switch strings.ToLower(c.Severity) {
+			case "critical", "high":
+				boundaryPink.Print(line)
+			case "medium":
+				vaultYellow.Print(line)
+			default:
+				waypointTeal.Print(line)
+			}
+		}
+		fmt.Println()
+	} else {
+		dimWhite.Println("  CVEs fixed by upgrading: none")
+		fmt.Println()
+	}
+
+	if len(payload.BreakingChanges) > 0 {
+		fromLabel := payload.FromVersion
+		if fromLabel == "" || fromLabel == "unknown" {
+			fromLabel = "current"
+		}
+		vaultYellow.Printf("  Breaking changes in %s → %s:\n", fromLabel, payload.TargetVersion)
+		for _, b := range payload.BreakingChanges {
+			fmt.Printf("    ⚠ %s\n", b)
+		}
+		fmt.Println()
+	} else if payload.BreakingChangesSource == "unavailable" {
+		dimWhite.Println("  Breaking changes: GitHub release notes unavailable")
+		fmt.Println()
+	} else {
+		dimWhite.Println("  Breaking changes: none detected in upstream release notes")
+		fmt.Println()
+	}
+
+	switch strings.ToLower(payload.Recommendation) {
+	case "go":
+		waypointTeal.Printf("  Recommendation: GO — %s\n", payload.RecommendationReason)
+	case "no_go":
+		boundaryPink.Printf("  Recommendation: NO-GO — %s\n", payload.RecommendationReason)
+	default:
+		vaultYellow.Printf("  Recommendation: REVIEW — %s\n", payload.RecommendationReason)
+	}
+	fmt.Println()
+}
+
 func stringField(m map[string]any, keys ...string) string {
 	for _, k := range keys {
 		if v, ok := m[k].(string); ok && v != "" {
@@ -1760,6 +1923,7 @@ func printHelp() {
 	fmt.Println("  /audit             Terraform version + CVE audit across all workspaces")
 	fmt.Println("  /modules           Per-workspace module version report from the Terraform Registry")
 	fmt.Println("  /providers         Per-workspace provider CVE and version report")
+	fmt.Println("  /upgrade <provider> <version>  Preview a provider upgrade — risk, CVE diff, breaking changes")
 	fmt.Println("  /reset             Clear conversation history")
 	fmt.Println("  /help              Show this help")
 	fmt.Println("  /exit              Exit")
