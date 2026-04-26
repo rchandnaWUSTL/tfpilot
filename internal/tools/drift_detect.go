@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -99,13 +100,33 @@ func driftDetectCall(ctx context.Context, args map[string]string, timeoutSec int
 	errMsg := stringField(attrs, "error-message")
 	asmtID := stringField(assessment, "id")
 
-	driftedAddresses := []string{}
+	driftedResources := []driftedResource{}
 	if drifted && resourcesDrifted > 0 {
 		jsonOutPath := stringField(links, "json-output")
 		if jsonOutPath != "" {
-			driftedAddresses = fetchDriftedAddresses(ctx, token, jsonOutPath, timeoutSec)
+			driftedResources = fetchDriftedResources(ctx, token, jsonOutPath, timeoutSec)
 		}
 	}
+	driftedAddresses := make([]string, 0, len(driftedResources))
+	for _, r := range driftedResources {
+		driftedAddresses = append(driftedAddresses, r.Address)
+	}
+
+	lastAssessedAt, _ := time.Parse(time.RFC3339, createdAt)
+	lastAssessedHuman := ""
+	if !lastAssessedAt.IsZero() {
+		lastAssessedHuman = humanRelative(lastAssessedAt)
+	}
+
+	assessmentStatus := "ok"
+	switch {
+	case errMsg != "" || !succeeded:
+		assessmentStatus = "error"
+	case drifted:
+		assessmentStatus = "drifted"
+	}
+
+	summary := buildDriftSummary(assessmentStatus, drifted, resourcesDrifted, resourcesUndrifted, lastAssessedHuman, errMsg)
 
 	payload := map[string]any{
 		"workspace":           workspace,
@@ -115,8 +136,12 @@ func driftDetectCall(ctx context.Context, args map[string]string, timeoutSec int
 		"drifted":             drifted,
 		"succeeded":           succeeded,
 		"last_assessment_at":  createdAt,
+		"last_assessed_human": lastAssessedHuman,
+		"assessment_status":   assessmentStatus,
+		"summary":             summary,
 		"resources_drifted":   resourcesDrifted,
 		"resources_undrifted": resourcesUndrifted,
+		"drifted_resources":   driftedResources,
 		"drifted_addresses":   driftedAddresses,
 		"error_message":       errMsg,
 	}
@@ -174,51 +199,126 @@ func fetchCurrentAssessment(ctx context.Context, token, wsID string, timeoutSec 
 	return doc.Data, nil
 }
 
-// fetchDriftedAddresses pulls the assessment's json-output (a Terraform plan
-// JSON) and returns the resource addresses whose change.actions is anything
+// driftedResource describes a single resource that has drifted from its
+// recorded state, enriched with the inferred provider short-name and a
+// human-readable change type.
+type driftedResource struct {
+	Address    string `json:"address"`
+	Provider   string `json:"provider"`
+	ChangeType string `json:"change_type"`
+}
+
+// fetchDriftedResources pulls the assessment's json-output (a Terraform plan
+// JSON) and returns one entry per resource whose change.actions is anything
 // other than ["no-op"]. Best-effort: returns an empty slice if the fetch or
 // parse fails — the caller still reports the high-level drift counts.
-func fetchDriftedAddresses(ctx context.Context, token, jsonOutPath string, timeoutSec int) []string {
+func fetchDriftedResources(ctx context.Context, token, jsonOutPath string, timeoutSec int) []driftedResource {
 	url := "https://app.terraform.io" + jsonOutPath
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(timeoutSec)*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(cctx, http.MethodGet, url, nil)
 	if err != nil {
-		return []string{}
+		return []driftedResource{}
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("User-Agent", "tfpilot")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return []string{}
+		return []driftedResource{}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return []string{}
+		return []driftedResource{}
 	}
 	body, rerr := io.ReadAll(resp.Body)
 	if rerr != nil {
-		return []string{}
+		return []driftedResource{}
 	}
 	var plan struct {
 		ResourceChanges []struct {
-			Address string `json:"address"`
-			Change  struct {
+			Address      string `json:"address"`
+			ProviderName string `json:"provider_name"`
+			Change       struct {
 				Actions []string `json:"actions"`
 			} `json:"change"`
 		} `json:"resource_changes"`
 	}
 	if err := json.Unmarshal(body, &plan); err != nil {
-		return []string{}
+		return []driftedResource{}
 	}
-	out := []string{}
+	out := []driftedResource{}
 	for _, rc := range plan.ResourceChanges {
-		if isDriftAction(rc.Change.Actions) && rc.Address != "" {
-			out = append(out, rc.Address)
+		if !isDriftAction(rc.Change.Actions) || rc.Address == "" {
+			continue
+		}
+		out = append(out, driftedResource{
+			Address:    rc.Address,
+			Provider:   providerFromAddress(rc.Address, rc.ProviderName),
+			ChangeType: changeTypeFromActions(rc.Change.Actions),
+		})
+	}
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Address < out[j].Address })
+	return out
+}
+
+// providerFromAddress derives the short provider name (e.g. "aws") from a
+// Terraform resource address. Falls back to the plan's provider_name field
+// when the address shape is ambiguous.
+func providerFromAddress(address, providerName string) string {
+	if i := strings.IndexAny(address, "_."); i > 0 {
+		return address[:i]
+	}
+	if providerName != "" {
+		if slash := strings.LastIndexByte(providerName, '/'); slash >= 0 && slash+1 < len(providerName) {
+			return providerName[slash+1:]
+		}
+		return providerName
+	}
+	return ""
+}
+
+// changeTypeFromActions maps a Terraform change.actions list to a single
+// human-readable change verb.
+func changeTypeFromActions(actions []string) string {
+	if len(actions) == 1 {
+		switch actions[0] {
+		case "update":
+			return "modified"
+		case "delete":
+			return "deleted"
+		case "create":
+			return "added"
+		case "no-op":
+			return "no-op"
 		}
 	}
-	sort.Strings(out)
-	return out
+	if len(actions) == 2 && actions[0] == "delete" && actions[1] == "create" {
+		return "replaced"
+	}
+	return "changed"
+}
+
+// buildDriftSummary assembles the plain-English summary string returned to
+// the agent. Lives next to the payload assembly so the wording stays close
+// to the fields it reads from.
+func buildDriftSummary(status string, drifted bool, resourcesDrifted, resourcesUndrifted int, lastAssessedHuman, errMsg string) string {
+	when := lastAssessedHuman
+	if when == "" {
+		when = "recently"
+	}
+	if status == "error" {
+		if errMsg != "" {
+			return fmt.Sprintf("Assessment failed (%s) — last attempted %s.", truncate(errMsg, 120), when)
+		}
+		return fmt.Sprintf("Assessment did not succeed, last attempted %s.", when)
+	}
+	if !drifted {
+		if resourcesUndrifted > 0 {
+			return fmt.Sprintf("No drift — %d resources in sync, last checked %s.", resourcesUndrifted, when)
+		}
+		return fmt.Sprintf("No drift detected, last checked %s.", when)
+	}
+	return fmt.Sprintf("%d resource(s) drifted, %d in sync, last checked %s.", resourcesDrifted, resourcesUndrifted, when)
 }
 
 func isDriftAction(actions []string) bool {

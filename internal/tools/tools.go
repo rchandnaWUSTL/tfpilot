@@ -30,6 +30,7 @@ var MutatingTools = map[string]bool{
 	"_hcp_tf_workspace_create":   true,
 	"_hcp_tf_workspace_populate": true,
 	"_hcp_tf_upgrade_preview":    true,
+	"_hcp_tf_rollback":           true,
 }
 
 // IsMutating reports whether a tool name triggers state changes.
@@ -1516,6 +1517,15 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	}
 	if name == "_hcp_tf_drift_detect" {
 		return driftDetectCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_org_timeline" {
+		return orgTimelineCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_rollback" {
+		return rollbackCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_incident_summary" {
+		return incidentSummaryCall(ctx, args, timeoutSec)
 	}
 
 	start := time.Now()
@@ -4760,6 +4770,47 @@ func Definitions() []ToolDef {
 			},
 		},
 		{
+			Name:        "_hcp_tf_org_timeline",
+			Description: "Fans out across every workspace in the org with at least one resource and returns the merged run history within the last `hours` (default 24), sorted newest-first. Each entry: { workspace, run_id, status, message, created_at, created_at_human, triggered_by, has_changes, additions, changes, destructions }. Also returns `anomalies[]` with type ∈ { multiple_changes_in_window, repeated_failure, unexpected_destruction, off_hours_change }. Use when the user asks 'what changed', 'what happened', or reports something is wrong in prod and needs cross-workspace correlation. Read-only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":              map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"hours":            map[string]any{"type": "string", "description": "Lookback window in hours (default 24)"},
+					"workspace_filter": map[string]any{"type": "string", "description": "Optional comma-separated list of workspace names to restrict the scan to"},
+				},
+				"required": []string{"org"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_rollback",
+			Description: "Reverts a workspace to a previous configuration by creating a new run against the previous applied run's configuration version. When `run_id` is omitted, picks the most recent `applied` run other than the current one. The new run is queued plan-only (auto-apply=false) — the agent must call _hcp_tf_plan_analyze on the resulting run, surface blast radius, and let the user approve via _hcp_tf_run_apply. Returns { workspace, rolled_back_to_run_id, rolled_back_to_created_at, rolled_back_to_human, new_run_id, status, next_step }. Mutating — requires --apply mode.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":       map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace": map[string]any{"type": "string", "description": "Workspace name to roll back"},
+					"run_id":    map[string]any{"type": "string", "description": "Optional explicit run ID to revert to. Must be in `applied` status. When omitted, the most recent applied run other than the current one is used."},
+				},
+				"required": []string{"org", "workspace"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_incident_summary",
+			Description: "Generates a postmortem-ready markdown incident report and writes it to ~/.tfpilot/incidents/<YYYY-MM-DD>-<workspace>.md. Pure transformation: pass the JSON output of an earlier _hcp_tf_org_timeline call as `timeline_data`, the JSON output of an earlier _hcp_tf_drift_detect call as `drift_data`, and optionally the `new_run_id` from _hcp_tf_rollback as `rollback_run_id`. The report includes Summary, Timeline table, Root Cause (inferred from drift), Impact, Resolution, and Action Items. Returns { report_path, incident_duration_minutes, root_cause, affected_workspaces, report_markdown }. Read-only — writes to local disk only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":             map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace":       map[string]any{"type": "string", "description": "Primary workspace involved in the incident"},
+					"timeline_data":   map[string]any{"type": "string", "description": "JSON string from a prior _hcp_tf_org_timeline call"},
+					"drift_data":      map[string]any{"type": "string", "description": "JSON string from a prior _hcp_tf_drift_detect call"},
+					"rollback_run_id": map[string]any{"type": "string", "description": "Optional new_run_id returned by _hcp_tf_rollback when a rollback was applied"},
+				},
+				"required": []string{"org", "workspace"},
+			},
+		},
+		{
 			Name:        "_hcp_tf_workspace_diff",
 			Description: "Compares two HCP Terraform workspaces by fetching each workspace's state in parallel and returning a structured resource-address diff: missing_in_a, missing_in_b, present_in_both, plus per-workspace resource counts.",
 			InputSchema: map[string]any{
@@ -4812,7 +4863,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_drift_detect",
-			Description: "Returns the latest health assessment for a workspace via the JSON:API current-assessment-result endpoint. Output: { workspace, org, assessments_enabled, assessment_id, drifted, succeeded, last_assessment_at, resources_drifted, resources_undrifted, drifted_addresses[], error_message }. When health assessments are not enabled (HTTP 404) returns { assessments_enabled: false, message }. Read-only.",
+			Description: "Returns the latest health assessment for a workspace via the JSON:API current-assessment-result endpoint. Output: { workspace, org, assessments_enabled, assessment_id, drifted, succeeded, assessment_status (ok|drifted|error), summary, last_assessment_at, last_assessed_human, resources_drifted, resources_undrifted, drifted_resources[{address,provider,change_type}], drifted_addresses[], error_message }. change_type ∈ { modified, deleted, added, replaced, changed }. When health assessments are not enabled (HTTP 404) returns { assessments_enabled: false, message }. Read-only.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{

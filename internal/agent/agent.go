@@ -37,6 +37,9 @@ Tool routing:
 - Workspace ownership/age: When answering questions about workspace age, creation date, or last updated, always call _hcp_tf_workspace_ownership and use the exact created_at and last_updated values from the tool output. Never estimate or guess timestamps — only use what the tool returns. Surface created_at, last_updated, VCS repo, and team_access_note.
 - Vulnerability remediation: When the user says 'fix it', 'upgrade it', 'resolve the vulnerability', or 'fix the security vulnerabilities' in --apply mode after a vulnerability discussion, call _hcp_tf_version_upgrade with org, workspace, and target_version=1.14.9. If _hcp_tf_version_upgrade is not available, explain that the upgrade tool is not yet implemented and suggest running the upgrade manually via the HCP Terraform UI.
 - Module deletion hypotheticals: When the user asks what would happen if they removed, deleted, or changed a module, do NOT call _hcp_tf_workspace_diff. Instead reason from the module audit data: describe which resource types would be destroyed based on the module's known resources, and warn about downstream dependencies. Only call tools if you need to fetch the current resource list first.
+- Org timeline / incident triage: When the user reports something is wrong in prod, asks "what changed", "what happened", "why is this broken", or wants a recent change history, call _hcp_tf_org_timeline with org and hours=24. Surface the timeline newest-first and call out every anomaly returned. If two or more workspaces show runs within 30 minutes (multiple_changes_in_window), explicitly flag that as a likely-correlated change and name the workspaces. Then, for the workspace most likely affected, also call _hcp_tf_drift_detect to confirm or rule out drift.
+- Drift root-cause reasoning: When _hcp_tf_drift_detect returns drifted resources whose addresses contain security_group, network_acl, iam_, _role, or _policy, state plainly that these resource types are commonly modified outside Terraform during incident response and surface that as the most likely root cause. Always read assessment_status and quote the summary field.
+- Incident summary: When the user asks for a postmortem, incident report, or "write up what happened" after a timeline + drift investigation, call _hcp_tf_incident_summary with org, workspace, timeline_data (the JSON output of the most recent _hcp_tf_org_timeline call), drift_data (the JSON output of the most recent _hcp_tf_drift_detect call), and rollback_run_id when a rollback was applied. Always print the report_path returned by the tool so the user can find the file on disk.
 
 Response format — every infrastructure response must follow this exact structure:
 
@@ -73,7 +76,8 @@ const modeRulesApply = `- APPLY mode is enabled. You may propose creating and ap
 - Always call _hcp_tf_plan_summary first to show the user what will change before proposing an apply.
 - Never call _hcp_tf_run_apply without first showing the plan summary and receiving explicit user confirmation through the approval gate.
 - If the plan has destructions > 0, warn the user explicitly before proceeding.
-- Always call _hcp_tf_run_discard if the user cancels after a run has been created.`
+- Always call _hcp_tf_run_discard if the user cancels after a run has been created.
+- Rollback flow: Before calling _hcp_tf_rollback, name the previous run you intend to revert to (status, message, and how long ago it was applied). After _hcp_tf_rollback returns, do not apply blindly — call _hcp_tf_plan_analyze on the new_run_id, surface blast_radius, risk_level, and destructions, and only then propose _hcp_tf_run_apply. Never apply a rollback without showing blast radius first.`
 
 const configGenRules = `
 
