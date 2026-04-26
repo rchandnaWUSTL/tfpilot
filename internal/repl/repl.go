@@ -880,7 +880,11 @@ func (r *REPL) handleProviders() {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+	// The provider audit fans out to OSV.dev for each provider AND probes the
+	// most recent plan export for required_providers constraints — that probe
+	// is a multi-step hcptf flow that can take 10s+ on its own. Use a longer
+	// outer deadline than other slash commands so the probe has runway.
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	result := tools.Call(ctx, "_hcp_tf_provider_audit",
@@ -901,36 +905,63 @@ func (r *REPL) handleProviders() {
 		FixedIn  string `json:"fixed_in"`
 	}
 	type providerRow struct {
-		Name           string   `json:"name"`
-		Namespace      string   `json:"namespace"`
-		RegistryPath   string   `json:"registry_path"`
-		PinnedVersion  string   `json:"pinned_version"`
-		LatestVersion  string   `json:"latest_version"`
-		VersionsBehind string   `json:"versions_behind"`
-		KnownCVEs      []cveRow `json:"known_cves"`
-		CVECount       int      `json:"cve_count"`
-		Status         string   `json:"status"`
-		UpgradeNote    string   `json:"upgrade_note"`
+		Name              string   `json:"name"`
+		Namespace         string   `json:"namespace"`
+		RegistryPath      string   `json:"registry_path"`
+		PinnedVersion     string   `json:"pinned_version"`
+		VersionConstraint string   `json:"version_constraint"`
+		LatestVersion     string   `json:"latest_version"`
+		AllCVEs           []cveRow `json:"all_cves"`
+		CurrentlyAffected []cveRow `json:"currently_affected"`
+		UpgradingFixes    []cveRow `json:"upgrading_fixes"`
+		CVECount          int      `json:"cve_count"`
+		Status            string   `json:"status"`
+		UpgradeNote       string   `json:"upgrade_note"`
 	}
 	var payload struct {
-		Org                      string        `json:"org"`
-		Workspace                string        `json:"workspace"`
-		ProviderVersionAvailable bool          `json:"provider_version_available"`
-		Providers                []providerRow `json:"providers"`
-		UnknownProviders         []string      `json:"unknown_providers"`
-		CVEDataUnavailable       bool          `json:"cve_data_unavailable"`
-		StateDownloadFailed      bool          `json:"state_download_failed"`
-		Note                     string        `json:"note"`
+		Org                 string        `json:"org"`
+		Workspace           string        `json:"workspace"`
+		Providers           []providerRow `json:"providers"`
+		UnknownProviders    []string      `json:"unknown_providers"`
+		CVEDataUnavailable  bool          `json:"cve_data_unavailable"`
+		StateDownloadFailed bool          `json:"state_download_failed"`
+		PinnedVersionSource string        `json:"pinned_version_source"`
+		Note                string        `json:"note"`
 	}
 	if err := json.Unmarshal(result.Output, &payload); err != nil {
 		boundaryPink.Printf("  ✗ _hcp_tf_provider_audit: could not parse output: %v\n", err)
 		return
 	}
 
+	printCVELine := func(c cveRow, suffix string) {
+		fix := ""
+		if c.FixedIn != "" {
+			fix = fmt.Sprintf(" (fixed in %s)", c.FixedIn)
+		}
+		summary := c.Summary
+		if suffix != "" {
+			summary = suffix
+		}
+		line := fmt.Sprintf("      %s (%s)%s — %s\n", c.ID, c.Severity, fix, summary)
+		switch c.Severity {
+		case "critical", "high":
+			boundaryPink.Print(line)
+		case "medium":
+			vaultYellow.Print(line)
+		default:
+			dimWhite.Print(line)
+		}
+	}
+
 	bold.Printf("  Provider Audit — %s\n", payload.Workspace)
 	fmt.Println()
 	dimWhite.Printf("  %d providers detected.\n", len(payload.Providers))
-	dimWhite.Println("  Note: Pinned versions unavailable — compare against your .terraform.lock.hcl.")
+	switch payload.PinnedVersionSource {
+	case "planexport":
+		dimWhite.Println("  Pinned versions inferred from required_providers constraints in the most recent plan export.")
+	default:
+		dimWhite.Println("  Pinned versions unknown — no plan export available; check .terraform.lock.hcl to compare.")
+	}
 	if payload.StateDownloadFailed {
 		vaultYellow.Println("  State download failed — providers extracted from resource addresses.")
 	}
@@ -940,28 +971,55 @@ func (r *REPL) handleProviders() {
 	fmt.Println()
 
 	for _, p := range payload.Providers {
-		header := fmt.Sprintf("  • %s    latest: %s    %d CVEs\n", p.RegistryPath, p.LatestVersion, p.CVECount)
-		if p.CVECount > 0 {
+		header := fmt.Sprintf("  • %s    latest: %s    %d known CVE%s\n", p.RegistryPath, p.LatestVersion, p.CVECount, plural(p.CVECount))
+		switch {
+		case len(p.CurrentlyAffected) > 0:
 			boundaryPink.Print(header)
-		} else {
+		case p.CVECount > 0:
+			vaultYellow.Print(header)
+		default:
 			waypointTeal.Print(header)
 		}
-		for _, c := range p.KnownCVEs {
-			fix := ""
-			if c.FixedIn != "" {
-				fix = fmt.Sprintf(" (fixed in %s)", c.FixedIn)
-			}
-			line := fmt.Sprintf("    %s (%s)%s — %s\n", c.ID, c.Severity, fix, c.Summary)
-			switch c.Severity {
-			case "critical", "high":
-				boundaryPink.Print(line)
-			case "medium":
-				vaultYellow.Print(line)
-			default:
-				dimWhite.Print(line)
+
+		pinnedLine := "    Pinned: unknown"
+		if p.PinnedVersion != "unknown" {
+			pinnedLine = fmt.Sprintf("    Pinned: %s", p.PinnedVersion)
+		}
+		if p.VersionConstraint != "" {
+			pinnedLine += fmt.Sprintf("    constraint: %s", p.VersionConstraint)
+		}
+		dimWhite.Println(pinnedLine)
+
+		if len(p.AllCVEs) > 0 {
+			fmt.Println()
+			dimWhite.Printf("    All known CVEs (%d):\n", len(p.AllCVEs))
+			for _, c := range p.AllCVEs {
+				printCVELine(c, "")
 			}
 		}
-		dimWhite.Printf("    Upgrade note: %s\n", p.UpgradeNote)
+
+		if len(p.CurrentlyAffected) > 0 {
+			fmt.Println()
+			boundaryPink.Printf("    Currently affected (on %s):\n", p.PinnedVersion)
+			for _, c := range p.CurrentlyAffected {
+				printCVELine(c, "")
+			}
+		}
+
+		if len(p.UpgradingFixes) > 0 && p.LatestVersion != "unavailable" {
+			fmt.Println()
+			waypointTeal.Printf("    Fixed by upgrading to %s:\n", p.LatestVersion)
+			for _, c := range p.UpgradingFixes {
+				suffix := c.Summary
+				if c.FixedIn != "" {
+					suffix = fmt.Sprintf("was fixed in %s — %s", c.FixedIn, c.Summary)
+				}
+				printCVELine(c, suffix)
+			}
+		}
+
+		fmt.Println()
+		dimWhite.Printf("    %s\n", p.UpgradeNote)
 		fmt.Println()
 	}
 

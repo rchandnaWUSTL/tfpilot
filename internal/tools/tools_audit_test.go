@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -147,6 +148,156 @@ func TestParseOSVResponse_NoVulns(t *testing.T) {
 	}
 	if len(entries) != 0 {
 		t.Errorf("got %d entries, want 0", len(entries))
+	}
+}
+
+func TestResolveExactConstraint(t *testing.T) {
+	tests := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"4.9.0", "4.9.0", true},
+		{"= 4.9.0", "4.9.0", true},
+		{"==4.9.0", "4.9.0", true},
+		{"v4.9.0", "4.9.0", true},
+		{"~> 4.45.0", "", false},
+		{">= 1.0.0", "", false},
+		{"< 5.0.0", "", false},
+		{"!= 4.9.0", "", false},
+		{"", "", false},
+		{">= 1.0, < 2.0", "", false},
+		{"4.9.0-rc1", "", false},
+		{"4.9", "", false},
+	}
+	for _, tc := range tests {
+		got, ok := resolveExactConstraint(tc.in)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("resolveExactConstraint(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+func TestParseProviderConstraints(t *testing.T) {
+	// Trimmed shape of mock-tfconfig-v2.sentinel: a top-level providers
+	// block followed by resources and module_calls. Only the providers
+	// block contributes — module_calls also use version_constraint but
+	// those describe modules, not providers.
+	body := []byte(`import "strings"
+
+providers = {
+	"aws": {
+		"alias": "",
+		"full_name":           "registry.terraform.io/hashicorp/aws",
+		"name":                "aws",
+		"version_constraint":  "~> 4.45.0",
+	},
+	"random": {
+		"alias": "",
+		"full_name":           "registry.terraform.io/hashicorp/random",
+		"name":                "random",
+		"version_constraint":  "3.5.0",
+	},
+}
+
+resources = {
+	"aws_security_group.app": {
+		"address": "aws_security_group.app",
+	},
+}
+
+module_calls = {
+	"vpc": {
+		"source":             "terraform-aws-modules/vpc/aws",
+		"version_constraint": "3.14.0",
+	},
+}
+`)
+	got := parseProviderConstraints(body)
+	if got == nil {
+		t.Fatal("parseProviderConstraints returned nil; want map with two providers")
+	}
+	if got["hashicorp/aws"] != "~> 4.45.0" {
+		t.Errorf("hashicorp/aws = %q, want ~> 4.45.0", got["hashicorp/aws"])
+	}
+	if got["hashicorp/random"] != "3.5.0" {
+		t.Errorf("hashicorp/random = %q, want 3.5.0", got["hashicorp/random"])
+	}
+	if _, ok := got["terraform-aws-modules/vpc/aws"]; ok {
+		t.Errorf("module-level version_constraint leaked into provider map")
+	}
+}
+
+func TestParseProviderConstraints_NoProvidersBlock(t *testing.T) {
+	if got := parseProviderConstraints([]byte("resources = {}")); got != nil {
+		t.Errorf("expected nil for body with no providers block, got %v", got)
+	}
+}
+
+func TestComputeCVEDiff_PinnedKnown(t *testing.T) {
+	cves := []advisoryEntry{
+		{ID: "CVE-A", Severity: "high", FixedIn: "5.0.0"},   // pinned (4.9.0) < 5.0.0; fixed_in <= latest (5.91.0) → both
+		{ID: "CVE-B", Severity: "medium", FixedIn: "4.5.0"}, // pinned (4.9.0) >= 4.5.0 → neither
+		{ID: "CVE-C", Severity: "high", FixedIn: ""},        // no fix → currently_affected only
+		{ID: "CVE-D", Severity: "low", FixedIn: "5.91.0"},   // boundary: fixed_in == latest → both
+	}
+	currently, fixes := computeCVEDiff("4.9.0", "5.91.0", cves)
+
+	currentIDs := map[string]bool{}
+	for _, c := range currently {
+		currentIDs[c.ID] = true
+	}
+	fixIDs := map[string]bool{}
+	for _, c := range fixes {
+		fixIDs[c.ID] = true
+	}
+
+	for _, want := range []string{"CVE-A", "CVE-C", "CVE-D"} {
+		if !currentIDs[want] {
+			t.Errorf("currently_affected missing %s", want)
+		}
+	}
+	if currentIDs["CVE-B"] {
+		t.Errorf("currently_affected should not include CVE-B (fix predates pinned)")
+	}
+	for _, want := range []string{"CVE-A", "CVE-D"} {
+		if !fixIDs[want] {
+			t.Errorf("upgrading_fixes missing %s", want)
+		}
+	}
+	if fixIDs["CVE-B"] || fixIDs["CVE-C"] {
+		t.Errorf("upgrading_fixes should not include CVE-B (already patched) or CVE-C (no fix)")
+	}
+}
+
+func TestComputeCVEDiff_NonNilSlices(t *testing.T) {
+	currently, fixes := computeCVEDiff("4.9.0", "5.91.0", nil)
+	if currently == nil || fixes == nil {
+		t.Errorf("computeCVEDiff returned nil slices; want empty slices for stable JSON output")
+	}
+}
+
+func TestBuildProviderUpgradeNote(t *testing.T) {
+	cases := []struct {
+		name                                       string
+		pinned, latest                             string
+		all, currently, fixes                      int
+		wantContains                               string
+	}{
+		{"unknown_with_cves", "unknown", "5.91.0", 4, 0, 4, "Pinned version is unknown — upgrading to 5.91.0 addresses all 4 known CVEs"},
+		{"unknown_no_cves", "unknown", "5.91.0", 0, 0, 0, "No known CVEs"},
+		{"latest_unavailable", "unknown", "unavailable", 0, 0, 0, "Could not determine latest"},
+		{"already_latest_with_cves", "5.91.0", "5.91.0", 2, 1, 0, "1 known CVE still affect"},
+		{"upgrade_resolves", "4.9.0", "5.91.0", 3, 2, 2, "upgrading to 5.91.0 would resolve 2 known CVEs"},
+		{"behind_no_cves", "4.9.0", "5.91.0", 0, 0, 0, "None of the 0 known CVEs"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildProviderUpgradeNote(tc.pinned, tc.latest, tc.all, tc.currently, tc.fixes)
+			if !strings.Contains(got, tc.wantContains) {
+				t.Errorf("note = %q, want to contain %q", got, tc.wantContains)
+			}
+		})
 	}
 }
 

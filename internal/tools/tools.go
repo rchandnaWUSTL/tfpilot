@@ -3172,10 +3172,12 @@ func moduleAuditCall(ctx context.Context, args map[string]string, timeoutSec int
 	return result
 }
 
-// providerAuditNote is appended to every _hcp_tf_provider_audit response so the
-// caller is reminded that pinned versions cannot be inferred from state and
-// that CVE data is sourced from OSV.dev.
-const providerAuditNote = "Provider versions are not available via the HCP Terraform API. Pinned versions require access to .terraform.lock.hcl. CVE data sourced from OSV.dev."
+// providerAuditNote is appended to every _hcp_tf_provider_audit response so
+// the caller knows where pinned-version data came from. The audit infers
+// pinned versions from the workspace's most recent plan-export bundle (the
+// `required_providers` constraint block); range constraints stay "unknown"
+// because they don't resolve to a single version. CVE data is OSV.dev.
+const providerAuditNote = "Pinned versions are inferred from the required_providers constraint block in the most recent plan export. Exact constraints (e.g. \"4.9.0\") are reported as pinned_version; range constraints (~>, >=, etc.) leave pinned_version: unknown. CVE data sourced from OSV.dev."
 
 // providerRef captures a single provider extracted from a workspace state or
 // resource list. Namespace and Name are decoded from the registry path; Raw is
@@ -3413,12 +3415,425 @@ func downloadWorkspaceState(ctx context.Context, org, workspace string, timeoutS
 	return out, nil
 }
 
-// providerAuditCall extracts the providers used by a workspace, fetches the
-// latest version of each hashicorp provider from the public registry, and
-// queries OSV.dev for known CVEs per provider. Pinned versions are not
-// available without access to .terraform.lock.hcl, so every entry is labeled
-// "check_recommended" and the response carries a note explaining the limit.
-// Read-only.
+// providerEntryRE pairs a provider's `full_name` with its `version_constraint`
+// inside the providers block. The non-greedy `.*?` between the two keys keeps
+// each block self-contained.
+var providerEntryRE = regexp.MustCompile(`(?s)"full_name"\s*:\s*"([^"]+)".*?"version_constraint"\s*:\s*"([^"]*)"`)
+
+// providerBlockHeaderRE matches the line that opens the top-level
+// `providers = {` block in a Sentinel mock-tfconfig-v2 file. We isolate this
+// block before applying providerEntryRE because module_calls in the same
+// file also uses the key `version_constraint` (to describe module versions,
+// not provider versions).
+var providerBlockHeaderRE = regexp.MustCompile(`^providers\s*=\s*\{\s*$`)
+
+// fetchProviderConstraintsFromPlanExport tries to recover per-provider
+// `required_providers` constraints from the workspace's most recent plan
+// export (sentinel-mock-bundle-v0). Returns map[registryPath]constraint, e.g.
+// {"hashicorp/aws": "~> 4.45.0"}. Returns nil on any failure — callers treat
+// absence as "no constraint information" and leave pinned_version "unknown".
+//
+// The probe orchestrates several sequential hcptf shell-outs plus a poll for
+// async export completion, so it gets its own 60s deadline regardless of the
+// per-call timeoutSec (which is sized for individual shell-outs). Caller ctx
+// cancellation still wins via the parent context.
+func fetchProviderConstraintsFromPlanExport(ctx context.Context, org, workspace string, timeoutSec int) map[string]string {
+	_ = timeoutSec // probe paces itself; param kept for signature parity with siblings
+	cctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	wsCmd := exec.CommandContext(cctx, "hcptf", "workspace", "read",
+		"-org="+org, "-name="+workspace, "-include=current_run", "-output=json")
+	wsOut, err := wsCmd.Output()
+	if err != nil || looksLikeHTML(string(wsOut)) {
+		return nil
+	}
+	var ws struct {
+		CurrentRunID string `json:"CurrentRunID"`
+	}
+	if err := json.Unmarshal(wsOut, &ws); err != nil || ws.CurrentRunID == "" {
+		return nil
+	}
+
+	runCmd := exec.CommandContext(cctx, "hcptf", "run", "show",
+		"-id="+ws.CurrentRunID, "-output=json")
+	runOut, err := runCmd.Output()
+	if err != nil || looksLikeHTML(string(runOut)) {
+		return nil
+	}
+	var run struct {
+		PlanID string `json:"PlanID"`
+	}
+	if err := json.Unmarshal(runOut, &run); err != nil || run.PlanID == "" {
+		return nil
+	}
+
+	expCmd := exec.CommandContext(cctx, "hcptf", "planexport", "create",
+		"-plan-id="+run.PlanID, "-output=json")
+	expOut, err := expCmd.Output()
+	var exp struct {
+		ID string `json:"ID"`
+	}
+	switch {
+	case err == nil && !looksLikeHTML(string(expOut)):
+		// `planexport create` prefixes a "Plan export 'pe-...' created successfully"
+		// line before the JSON; trim to the opening brace.
+		if i := bytes.IndexByte(expOut, '{'); i > 0 {
+			expOut = expOut[i:]
+		}
+		if uerr := json.Unmarshal(expOut, &exp); uerr != nil || exp.ID == "" {
+			return nil
+		}
+	case err != nil:
+		// TFC permits only one pending/downloadable export per plan per data
+		// type. When a previous audit (in this or another session) crashed
+		// before the cleanup defer ran, the next create returns "Plan already
+		// has a pending or downloadable export of this type". Recover the
+		// existing export id via the JSON API since hcptf surfaces no list
+		// command, then reuse it; the defer below still cleans up afterwards.
+		stderr := ""
+		if e, ok := err.(*exec.ExitError); ok {
+			stderr = string(e.Stderr)
+		}
+		if !strings.Contains(stderr, "Plan already has") {
+			return nil
+		}
+		existing := lookupExistingPlanExport(cctx, run.PlanID)
+		if existing == "" {
+			return nil
+		}
+		exp.ID = existing
+	default:
+		return nil
+	}
+	// Best-effort cleanup: delete the export when we're done with it. Detached
+	// context so the deletion still runs even if the parent ctx is mid-
+	// cancellation. Without this, the next audit invocation hits "Plan already
+	// has a pending or downloadable export" and falls back to the API lookup.
+	defer func() {
+		delCtx, delCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer delCancel()
+		delCmd := exec.CommandContext(delCtx, "hcptf", "planexport", "delete",
+			"-id="+exp.ID, "-y")
+		_ = delCmd.Run()
+	}()
+
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		readCmd := exec.CommandContext(cctx, "hcptf", "planexport", "read",
+			"-id="+exp.ID, "-output=json")
+		readOut, rerr := readCmd.Output()
+		if rerr != nil {
+			return nil
+		}
+		var status struct {
+			Status string `json:"Status"`
+		}
+		if uerr := json.Unmarshal(readOut, &status); uerr != nil {
+			return nil
+		}
+		if status.Status == "finished" {
+			break
+		}
+		if status.Status == "errored" || status.Status == "expired" || status.Status == "canceled" {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(2 * time.Second)
+	}
+
+	tmpDir, err := os.MkdirTemp("", "tfpilot-pe-")
+	if err != nil {
+		return nil
+	}
+	defer os.RemoveAll(tmpDir)
+	archive := filepath.Join(tmpDir, "pe.tar.gz")
+	dlCmd := exec.CommandContext(cctx, "hcptf", "planexport", "download",
+		"-id="+exp.ID, "-path="+archive)
+	if _, err := dlCmd.Output(); err != nil {
+		return nil
+	}
+
+	body, err := readSentinelTfconfigV2(archive)
+	if err != nil {
+		return nil
+	}
+	return parseProviderConstraints(body)
+}
+
+// lookupExistingPlanExport fetches a plan via the TFC HTTP API to recover the
+// ID of an existing plan-export. Used as a fallback when `hcptf planexport
+// create` returns "Plan already has a pending or downloadable export" — the
+// hcptf CLI surfaces no list-by-plan command for plan exports, but the JSON
+// API exposes the relationship under data.relationships.exports.
+//
+// Returns "" on any failure. The caller treats absence as "no recovery
+// possible" and degrades pinned_version_source to "unknown".
+func lookupExistingPlanExport(ctx context.Context, planID string) string {
+	token := readTFCToken()
+	if token == "" {
+		return ""
+	}
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(cctx, http.MethodGet,
+		"https://app.terraform.io/api/v2/plans/"+planID, nil)
+	if err != nil {
+		return ""
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Content-Type", "application/vnd.api+json")
+	req.Header.Set("User-Agent", "tfpilot/1.5")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return ""
+	}
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return ""
+	}
+	var doc struct {
+		Data struct {
+			Relationships struct {
+				Exports struct {
+					Data []struct {
+						ID   string `json:"id"`
+						Type string `json:"type"`
+					} `json:"data"`
+				} `json:"exports"`
+			} `json:"relationships"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(raw, &doc); err != nil {
+		return ""
+	}
+	for _, e := range doc.Data.Relationships.Exports.Data {
+		if e.Type == "plan-exports" && e.ID != "" {
+			return e.ID
+		}
+	}
+	return ""
+}
+
+// readTFCToken reads the bearer token from the standard Terraform credentials
+// file at ~/.terraform.d/credentials.tfrc.json. Returns "" when the file is
+// missing or malformed; callers fall back to whatever read-only path remains.
+func readTFCToken() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	raw, err := os.ReadFile(filepath.Join(home, ".terraform.d", "credentials.tfrc.json"))
+	if err != nil {
+		return ""
+	}
+	var creds struct {
+		Credentials map[string]struct {
+			Token string `json:"token"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(raw, &creds); err != nil {
+		return ""
+	}
+	if c, ok := creds.Credentials["app.terraform.io"]; ok {
+		return c.Token
+	}
+	return ""
+}
+
+// readSentinelTfconfigV2 untars a Sentinel mock bundle (.tar.gz) and returns
+// the body of mock-tfconfig-v2.sentinel — the file that carries the
+// `required_providers` constraint block.
+func readSentinelTfconfigV2(archivePath string) ([]byte, error) {
+	f, err := os.Open(archivePath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+	tr := tar.NewReader(gz)
+	for {
+		hdr, terr := tr.Next()
+		if terr == io.EOF {
+			return nil, fmt.Errorf("mock-tfconfig-v2.sentinel not found")
+		}
+		if terr != nil {
+			return nil, terr
+		}
+		if filepath.Base(hdr.Name) == "mock-tfconfig-v2.sentinel" {
+			return io.ReadAll(tr)
+		}
+	}
+}
+
+// parseProviderConstraints walks the `providers = {...}` block of a
+// mock-tfconfig-v2.sentinel body and returns a map of registryPath to
+// version_constraint string. Returns nil when no providers block is found.
+//
+// The block is isolated by line-scan: the opening line is `providers = {`,
+// and the close is a `}` at column zero (Sentinel mock files emit each
+// top-level binding's close brace flush left). Anything between is fed to
+// providerEntryRE to pair full_name with version_constraint.
+func parseProviderConstraints(body []byte) map[string]string {
+	lines := strings.Split(string(body), "\n")
+	startIdx := -1
+	for i, line := range lines {
+		if providerBlockHeaderRE.MatchString(line) {
+			startIdx = i + 1
+			break
+		}
+	}
+	if startIdx < 0 {
+		return nil
+	}
+	endIdx := -1
+	for i := startIdx; i < len(lines); i++ {
+		if lines[i] == "}" {
+			endIdx = i
+			break
+		}
+	}
+	if endIdx < 0 {
+		return nil
+	}
+	block := []byte(strings.Join(lines[startIdx:endIdx], "\n"))
+	out := map[string]string{}
+	for _, match := range providerEntryRE.FindAllSubmatch(block, -1) {
+		fullName := string(match[1])
+		constraint := strings.TrimSpace(string(match[2]))
+		for _, host := range []string{"registry.terraform.io/", "registry.opentofu.org/"} {
+			fullName = strings.TrimPrefix(fullName, host)
+		}
+		if fullName == "" || strings.Count(fullName, "/") != 1 {
+			continue
+		}
+		out[fullName] = constraint
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// resolveExactConstraint returns (version, true) when the constraint string
+// reduces to a single literal version (e.g. "4.9.0", "= 4.9.0", "v4.9.0").
+// Range operators (~>, >=, <=, <, >, !=) and compound constraints yield
+// ("", false) — those forms don't pin to a single version, so we leave the
+// audit's pinned_version as "unknown".
+func resolveExactConstraint(c string) (string, bool) {
+	s := strings.TrimSpace(c)
+	if s == "" {
+		return "", false
+	}
+	for _, op := range []string{"~>", ">=", "<=", "!=", ">", "<"} {
+		if strings.HasPrefix(s, op) {
+			return "", false
+		}
+	}
+	for _, prefix := range []string{"==", "=", "v", "V"} {
+		if strings.HasPrefix(s, prefix) {
+			s = strings.TrimSpace(strings.TrimPrefix(s, prefix))
+		}
+	}
+	if strings.ContainsAny(s, " \t,*~!<>=") {
+		return "", false
+	}
+	parts := strings.Split(s, ".")
+	if len(parts) != 3 {
+		return "", false
+	}
+	for _, p := range parts {
+		if p == "" {
+			return "", false
+		}
+		for _, ch := range p {
+			if ch < '0' || ch > '9' {
+				return "", false
+			}
+		}
+	}
+	return s, true
+}
+
+// computeCVEDiff partitions the full CVE list for a provider into the two
+// slices the audit surfaces:
+//   - currentlyAffected: pinned predates fixed_in (or fix unknown).
+//   - upgradingFixes:    fixed_in is between pinned and latest, inclusive of
+//     latest.
+//
+// Both slices are non-nil so JSON marshals as `[]` rather than `null`. Only
+// called when both pinned and latest are real versions; the unknown-pinned
+// path bypasses this and copies all CVEs into upgradingFixes.
+func computeCVEDiff(pinned, latest string, cves []advisoryEntry) (currentlyAffected, upgradingFixes []advisoryEntry) {
+	currentlyAffected = []advisoryEntry{}
+	upgradingFixes = []advisoryEntry{}
+	for _, c := range cves {
+		if c.FixedIn == "" || compareSemver(pinned, c.FixedIn) < 0 {
+			currentlyAffected = append(currentlyAffected, c)
+		}
+		if c.FixedIn != "" &&
+			compareSemver(pinned, c.FixedIn) < 0 &&
+			compareSemver(c.FixedIn, latest) <= 0 {
+			upgradingFixes = append(upgradingFixes, c)
+		}
+	}
+	return currentlyAffected, upgradingFixes
+}
+
+// buildProviderUpgradeNote writes the plain-English upgrade summary for a
+// single provider entry. The agent's system prompt instructs it to surface
+// this verbatim, so the wording carries the operator-facing explanation of
+// what pinned_version, currently_affected, and upgrading_fixes actually mean.
+func buildProviderUpgradeNote(pinned, latest string, allCVEs, currentlyAffected, upgradingFixes int) string {
+	if latest == "unavailable" {
+		return "Could not determine latest version from the registry."
+	}
+	if pinned == "unknown" {
+		if allCVEs == 0 {
+			return fmt.Sprintf("No known CVEs for this provider. Pinned version is unknown — check .terraform.lock.hcl. Upgrading to %s is still recommended to stay current.", latest)
+		}
+		return fmt.Sprintf("Pinned version is unknown — upgrading to %s addresses all %d known CVE%s. Check .terraform.lock.hcl to determine which apply to your current version.", latest, allCVEs, plural(allCVEs))
+	}
+	if compareSemver(pinned, latest) >= 0 {
+		if allCVEs == 0 {
+			return fmt.Sprintf("Pinned at %s, which is the latest. No known CVEs for this provider.", pinned)
+		}
+		if currentlyAffected == 0 {
+			return fmt.Sprintf("Pinned at %s, which is the latest. None of the %d known CVE%s affect this version.", pinned, allCVEs, plural(allCVEs))
+		}
+		return fmt.Sprintf("Pinned at %s; %d known CVE%s still affect this version with no published fix yet.", pinned, currentlyAffected, plural(currentlyAffected))
+	}
+	if upgradingFixes == 0 && currentlyAffected == 0 {
+		return fmt.Sprintf("Pinned at %s; latest is %s. None of the %d known CVE%s affect this version.", pinned, latest, allCVEs, plural(allCVEs))
+	}
+	if upgradingFixes == 0 {
+		return fmt.Sprintf("Pinned at %s; latest is %s. %d CVE%s affect this version but no fix has been published yet.", pinned, latest, currentlyAffected, plural(currentlyAffected))
+	}
+	return fmt.Sprintf("Pinned at %s; upgrading to %s would resolve %d known CVE%s.", pinned, latest, upgradingFixes, plural(upgradingFixes))
+}
+
+func plural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}
+
+// providerAuditCall extracts the providers used by a workspace, infers
+// pinned versions from the most recent plan export's required_providers
+// block, fetches the latest registry version, queries OSV.dev for every
+// known CVE per provider, and partitions those CVEs into currently_affected
+// and upgrading_fixes when pinned is an exact version. Read-only.
 func providerAuditCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
 	start := time.Now()
 	result := &CallResult{ToolName: "_hcp_tf_provider_audit", Args: args}
@@ -3479,13 +3894,31 @@ func providerAuditCall(ctx context.Context, args map[string]string, timeoutSec i
 	}
 	sort.Strings(unknown)
 
+	// Probe the most recent plan export for required_providers constraints
+	// in parallel with the OSV/registry fan-out below. The probe is a
+	// multi-step async flow (workspace read → run show → planexport create →
+	// poll → download → parse) so we don't want it gating OSV calls.
+	type probeResult struct {
+		constraints map[string]string
+		source      string
+	}
+	probeCh := make(chan probeResult, 1)
+	go func() {
+		c := fetchProviderConstraintsFromPlanExport(ctx, org, workspace, timeoutSec)
+		src := "unknown"
+		if len(c) > 0 {
+			src = "planexport"
+		}
+		probeCh <- probeResult{constraints: c, source: src}
+	}()
+
 	// Fan out registry + OSV lookups with bounded concurrency.
 	type fetched struct {
-		idx     int
-		entry   *providerRegistryEntry
-		regBad  bool
-		cves    []advisoryEntry
-		cveBad  bool
+		idx    int
+		entry  *providerRegistryEntry
+		regBad bool
+		cves   []advisoryEntry
+		cveBad bool
 	}
 	var mu sync.Mutex
 	var wg sync.WaitGroup
@@ -3514,17 +3947,26 @@ func providerAuditCall(ctx context.Context, args map[string]string, timeoutSec i
 		}
 	}
 
+	// Reap the probe goroutine started above. The fan-out usually outlives
+	// the probe in workspaces with many providers, but on small workspaces
+	// the probe can take longer than the OSV calls.
+	probe := <-probeCh
+	constraints := probe.constraints
+	pinnedSource := probe.source
+
 	type providerEntry struct {
-		Name           string          `json:"name"`
-		Namespace      string          `json:"namespace"`
-		RegistryPath   string          `json:"registry_path"`
-		PinnedVersion  string          `json:"pinned_version"`
-		LatestVersion  string          `json:"latest_version"`
-		VersionsBehind string          `json:"versions_behind"`
-		KnownCVEs      []advisoryEntry `json:"known_cves"`
-		CVECount       int             `json:"cve_count"`
-		Status         string          `json:"status"`
-		UpgradeNote    string          `json:"upgrade_note"`
+		Name              string          `json:"name"`
+		Namespace         string          `json:"namespace"`
+		RegistryPath      string          `json:"registry_path"`
+		PinnedVersion     string          `json:"pinned_version"`
+		VersionConstraint string          `json:"version_constraint"`
+		LatestVersion     string          `json:"latest_version"`
+		AllCVEs           []advisoryEntry `json:"all_cves"`
+		CurrentlyAffected []advisoryEntry `json:"currently_affected"`
+		UpgradingFixes    []advisoryEntry `json:"upgrading_fixes"`
+		CVECount          int             `json:"cve_count"`
+		Status            string          `json:"status"`
+		UpgradeNote       string          `json:"upgrade_note"`
 	}
 	entries := make([]providerEntry, 0, len(known))
 	for i, k := range known {
@@ -3537,26 +3979,48 @@ func providerAuditCall(ctx context.Context, args map[string]string, timeoutSec i
 		if cves == nil {
 			cves = []advisoryEntry{}
 		}
-		var note string
-		switch {
-		case latest == "unavailable":
-			note = "Could not determine latest version from the registry."
-		case len(cves) > 0:
-			note = fmt.Sprintf("Upgrading to %s would address %d known CVEs.", latest, len(cves))
-		default:
-			note = fmt.Sprintf("No known CVEs found for this provider. Upgrading to %s is still recommended to stay current.", latest)
+
+		constraint := constraints[k.registryPath]
+		pinned := "unknown"
+		if v, ok := resolveExactConstraint(constraint); ok {
+			pinned = v
 		}
+
+		var currentlyAffected, upgradingFixes []advisoryEntry
+		if pinned != "unknown" && latest != "unavailable" {
+			currentlyAffected, upgradingFixes = computeCVEDiff(pinned, latest, cves)
+		} else {
+			currentlyAffected = []advisoryEntry{}
+			upgradingFixes = append([]advisoryEntry{}, cves...)
+		}
+
+		status := "check_recommended"
+		if pinned != "unknown" && latest != "unavailable" {
+			switch {
+			case len(currentlyAffected) > 0:
+				status = "needs_upgrade"
+			case compareSemver(pinned, latest) >= 0:
+				status = "current"
+			default:
+				status = "needs_upgrade"
+			}
+		}
+
+		note := buildProviderUpgradeNote(pinned, latest, len(cves), len(currentlyAffected), len(upgradingFixes))
+
 		entries = append(entries, providerEntry{
-			Name:           k.ref.Name,
-			Namespace:      k.ref.Namespace,
-			RegistryPath:   k.registryPath,
-			PinnedVersion:  "unknown",
-			LatestVersion:  latest,
-			VersionsBehind: "unknown",
-			KnownCVEs:      cves,
-			CVECount:       len(cves),
-			Status:         "check_recommended",
-			UpgradeNote:    note,
+			Name:              k.ref.Name,
+			Namespace:         k.ref.Namespace,
+			RegistryPath:      k.registryPath,
+			PinnedVersion:     pinned,
+			VersionConstraint: constraint,
+			LatestVersion:     latest,
+			AllCVEs:           cves,
+			CurrentlyAffected: currentlyAffected,
+			UpgradingFixes:    upgradingFixes,
+			CVECount:          len(cves),
+			Status:            status,
+			UpgradeNote:       note,
 		})
 	}
 
@@ -3565,14 +4029,14 @@ func providerAuditCall(ctx context.Context, args map[string]string, timeoutSec i
 	}
 
 	payload := map[string]any{
-		"org":                        org,
-		"workspace":                  workspace,
-		"provider_version_available": false,
-		"providers":                  entries,
-		"unknown_providers":          unknown,
-		"cve_data_unavailable":       cveDataUnavailable,
-		"state_download_failed":      stateDownloadFailed,
-		"note":                       providerAuditNote,
+		"org":                   org,
+		"workspace":             workspace,
+		"providers":             entries,
+		"unknown_providers":     unknown,
+		"cve_data_unavailable":  cveDataUnavailable,
+		"state_download_failed": stateDownloadFailed,
+		"pinned_version_source": pinnedSource,
+		"note":                  providerAuditNote,
 	}
 
 	body, mErr := json.Marshal(payload)
@@ -4441,7 +4905,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_provider_audit",
-			Description: "Audits Terraform providers in a workspace. Downloads the workspace's state JSON via `hcptf state download` to extract provider names; falls back to per-resource provider fields when state download fails. For each `hashicorp/*` provider, fetches the latest version from the public registry and queries OSV.dev for known CVEs. Pinned versions are not available without access to `.terraform.lock.hcl`, so every entry is labeled `pinned_version: unknown` and `status: check_recommended`. CVE lookups omit a version field, so the response surfaces every known CVE for the provider — framed as what an upgrade would address. Non-hashicorp providers are surfaced separately under `unknown_providers`. Read-only; degrades to `cve_data_unavailable: true` when OSV is unreachable.",
+			Description: "Audits Terraform providers in a workspace and partitions known CVEs into what currently affects the pinned version vs. what an upgrade would resolve. Downloads workspace state via `hcptf state download` to extract provider names (falls back to per-resource provider fields). Probes the workspace's most recent plan export for required_providers constraints — exact constraints (e.g. `4.9.0`) populate `pinned_version`, range constraints (`~> 4.45.0`, etc.) leave `pinned_version: \"unknown\"` and the raw constraint is exposed in `version_constraint`. For each hashicorp/* provider, fetches the latest registry version and queries OSV.dev for every known CVE. Each provider entry returns `all_cves` (every known CVE), `currently_affected` (CVEs whose fix postdates the pinned version, or empty when pinned is unknown), and `upgrading_fixes` (CVEs whose fix is reachable by upgrading to the latest version; equals `all_cves` when pinned is unknown). The envelope's `pinned_version_source` is `\"planexport\"` when constraints were discovered, `\"unknown\"` otherwise. Non-hashicorp providers are surfaced under `unknown_providers`. Read-only; degrades to `cve_data_unavailable: true` when OSV is unreachable.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
