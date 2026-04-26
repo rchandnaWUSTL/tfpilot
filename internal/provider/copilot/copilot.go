@@ -72,7 +72,7 @@ func New(opts Options) *Provider {
 		p.deviceFlow = RunDeviceFlow
 	}
 	if p.httpClient == nil {
-		p.httpClient = &http.Client{Timeout: 60 * time.Second}
+		p.httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
 	if p.promptIn == nil {
 		p.promptIn = os.Stdin

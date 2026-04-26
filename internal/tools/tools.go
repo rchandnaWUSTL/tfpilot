@@ -3167,7 +3167,7 @@ func moduleAuditCall(ctx context.Context, args map[string]string, timeoutSec int
 	payload := map[string]any{
 		"workspace":        workspace,
 		"org":              org,
-		"modules_detected": len(names),
+		"modules_detected": len(entries),
 		"modules":          entries,
 		"unknown_modules":  unknown,
 		"note":             moduleAuditNote,

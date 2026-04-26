@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -266,6 +267,15 @@ func RunDeviceFlow(ctx context.Context, domain string, out io.Writer) (string, e
 	}
 }
 
+// isTimeoutError detects if an error is a network timeout.
+func isTimeoutError(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
 // ExchangeCopilotToken trades a long-lived GitHub token for a short-lived
 // Copilot chat bearer. The endpoint returns JSON including `token`,
 // `expires_at` (unix seconds), and `endpoints.api` (the per-account chat base
@@ -273,6 +283,8 @@ func RunDeviceFlow(ctx context.Context, domain string, out io.Writer) (string, e
 func ExchangeCopilotToken(ctx context.Context, httpClient *http.Client, apiBase, githubToken string) (*CopilotToken, error) {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
+	} else if httpClient.Timeout == 0 {
+		httpClient = &http.Client{Transport: httpClient.Transport, Timeout: 30 * time.Second}
 	}
 	exchangeURL := apiBase + "/copilot_internal/v2/token"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, exchangeURL, nil)
@@ -291,6 +303,9 @@ func ExchangeCopilotToken(ctx context.Context, httpClient *http.Client, apiBase,
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		if isTimeoutError(err) {
+			return nil, fmt.Errorf("Copilot token exchange timed out. Check your network connection and try again.")
+		}
 		return nil, fmt.Errorf("copilot token exchange: %w", err)
 	}
 	raw, _ := io.ReadAll(resp.Body)

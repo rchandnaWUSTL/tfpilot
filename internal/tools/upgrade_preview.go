@@ -72,11 +72,16 @@ func upgradePreviewCall(ctx context.Context, args map[string]string, timeoutSec 
 		result.Duration = time.Since(start)
 		return result
 	}
+
+	// Extract available providers for a better error message
+	availableProviders := extractProviderNames(auditRes.Output)
+
 	pinnedVersion, pinnedSource, upgradingFixes, providerKnown := lookupProviderInAudit(auditRes.Output, provider)
 	if !providerKnown {
 		result.Err = &ToolError{
-			ErrorCode: "invalid_tool",
-			Message:   fmt.Sprintf("provider %q not found in workspace %q — call _hcp_tf_provider_audit to see available providers", provider, workspace),
+			ErrorCode: "provider_not_found",
+			Message:   fmt.Sprintf("Provider %s is not used in workspace %s. Available providers: %s", provider, workspace, strings.Join(availableProviders, ", ")),
+			Retryable: false,
 		}
 		result.Duration = time.Since(start)
 		return result
@@ -239,6 +244,24 @@ func lookupProviderInAudit(raw json.RawMessage, providerShort string) (string, s
 		}
 	}
 	return "unknown", env.PinnedSource, nil, false
+}
+
+// extractProviderNames extracts the list of available provider names from the provider audit output.
+func extractProviderNames(raw json.RawMessage) []string {
+	var env struct {
+		Providers []struct {
+			Name string `json:"name"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return []string{}
+	}
+	names := make([]string, len(env.Providers))
+	for i, p := range env.Providers {
+		names[i] = p.Name
+	}
+	sort.Strings(names)
+	return names
 }
 
 // copyTFFiles copies every .tf file (and .tfvars) from src to dst at the top
