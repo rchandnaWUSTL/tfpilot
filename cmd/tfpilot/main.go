@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 
 	"github.com/fatih/color"
 	"github.com/rchandnaWUSTL/tfpilot/internal/config"
@@ -24,6 +25,8 @@ func main() {
 	workspace := flag.String("workspace", "", "HCP Terraform workspace")
 	auth := flag.String("auth", "", "Auth backend: '' (default, use model_provider from config) or 'copilot'")
 	apply := flag.Bool("apply", false, "Enable mutation mode (run create/apply/discard). Default is readonly.")
+	watch := flag.Bool("watch", false, "Enable watch mode — scan org and surface suggestions proactively")
+	mode := flag.String("mode", "suggest", "Watch mode: suggest (default) | report")
 	flag.Parse()
 
 	if err := runStartupChecks(); err != nil {
@@ -57,6 +60,36 @@ func main() {
 
 	cfg.Model = providerfactory.ModelFor(cfg, authMode)
 	cfg.Readonly = !*apply
+	cfg.Watch = *watch
+	cfg.Mode = strings.ToLower(strings.TrimSpace(*mode))
+
+	if cfg.Watch {
+		if *org == "" {
+			red.Fprintln(os.Stderr, "  ✗ --watch requires --org")
+			os.Exit(1)
+		}
+		switch cfg.Mode {
+		case "suggest":
+			if cfg.Readonly {
+				red.Fprintln(os.Stderr, "  ✗ Watch mode with --mode=suggest requires --apply")
+				os.Exit(1)
+			}
+		case "report":
+			// read-only, no --apply needed
+		case "auto":
+			red.Fprintln(os.Stderr, "  ✗ Auto mode not yet available. Use --mode=suggest.")
+			os.Exit(1)
+		default:
+			red.Fprintf(os.Stderr, "  ✗ Unknown --mode=%s. Use suggest or report.\n", cfg.Mode)
+			os.Exit(1)
+		}
+
+		if err := runWatchMode(context.Background(), cfg, *org); err != nil {
+			red.Fprintf(os.Stderr, "  ✗ %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	r := repl.New(cfg, prov, *org, *workspace)
 	if err := r.Run(); err != nil {

@@ -20,6 +20,8 @@ type Config struct {
 	Readonly       bool   `yaml:"readonly"`
 	ModelProvider  string `yaml:"model_provider"`
 	OpenAIBaseURL  string `yaml:"openai_base_url"`
+	Watch          bool   `yaml:"-"`
+	Mode           string `yaml:"-"`
 }
 
 var defaults = Config{

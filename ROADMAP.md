@@ -181,7 +181,19 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Integrates with v1.5 single-workspace remediation ("fix the most critical one") and v1.7 batch remediation ("fix the rest") for the follow-up fix cycle
 - Read-only — does NOT auto-remediate; findings always presented first, remediation requires explicit user follow-up under --apply mode
 
-## v1.9 — Observability and Metrics
+## v1.9 — Watch Mode (Shipped)
+- `--watch` flag: agent boots silently, scans org, surfaces proactive suggestions
+- `--mode=suggest` (default): scan → suggest → approve → execute → report; requires `--apply`
+- `--mode=report`: scan and generate compliance report only (read-only, no `--apply` needed)
+- `--mode=auto`: reserved; returns "not yet available" until a future release
+- runWatchMode bypasses the agent entirely and calls tools directly: `_hcp_tf_compliance_summary` → `_hcp_tf_version_audit` (max FixedIn semver picks target version) → `_hcp_tf_batch_upgrade` for queue → `_hcp_tf_version_upgrade` per workspace → `_hcp_tf_compliance_report`
+- Workspace queue re-sorted lowest-risk-first (RiskFlag asc, ResourceCount asc, name asc) so safe upgrades happen before destructive ones
+- Suggestion surface: top CVE id/severity/summary, target version, blast radius (workspaces, resources, destructive change count); destructive count > 0 raises a boundaryPink warning
+- Approval gate: a single `y`/`n`/`report` line — two characters of input secures the org
+- Markdown compliance report written to `~/.tfpilot/reports/compliance-report-<timestamp>.md`; `_hcp_tf_compliance_report` gained an optional `output_dir` argument that watch mode uses (and the agent batch flow continues to write to cwd as before)
+- Tool calls (including the per-workspace `version_upgrade` invocations) flow through `tools.Call`, so every action lands in `~/.tfpilot/audit.log`
+
+## v1.10 — Observability and Metrics
 - Usage analytics: sessions per workspace, tool call frequency, apply success rates
 - Audit log visualization: searchable, filterable view of ~/.tfpilot/audit.log entries
 - Agent call patterns: which tools are invoked together, which prompts lead to applies vs. read-only sessions

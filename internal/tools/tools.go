@@ -1577,6 +1577,23 @@ func auditLogPath() (string, error) {
 	return filepath.Join(dir, "audit.log"), nil
 }
 
+func expandHomeDir(p string) (string, error) {
+	if p == "" {
+		return p, nil
+	}
+	if p == "~" || strings.HasPrefix(p, "~/") {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", err
+		}
+		if p == "~" {
+			return home, nil
+		}
+		return filepath.Join(home, p[2:]), nil
+	}
+	return p, nil
+}
+
 var (
 	whoAmIOnce sync.Once
 	whoAmIVal  string
@@ -2552,12 +2569,29 @@ func complianceReportCall(ctx context.Context, args map[string]string, timeoutSe
 
 	report := b.String()
 
-	cwd, _ := os.Getwd()
-	if cwd == "" {
-		cwd = "."
+	var reportDir string
+	if outputDir := strings.TrimSpace(args["output_dir"]); outputDir != "" {
+		expanded, eerr := expandHomeDir(outputDir)
+		if eerr != nil {
+			result.Err = &ToolError{ErrorCode: "invalid_tool", Message: "output_dir: " + eerr.Error()}
+			result.Duration = time.Since(start)
+			return result
+		}
+		if mkErr := os.MkdirAll(expanded, 0o755); mkErr != nil {
+			result.Err = &ToolError{ErrorCode: "execution_error", Message: "create report dir: " + mkErr.Error()}
+			result.Duration = time.Since(start)
+			return result
+		}
+		reportDir = expanded
+	} else {
+		cwd, _ := os.Getwd()
+		if cwd == "" {
+			cwd = "."
+		}
+		reportDir = cwd
 	}
 	fileName := fmt.Sprintf("compliance-report-%s.md", strings.ReplaceAll(now.Format("2006-01-02T15-04-05Z"), ":", "-"))
-	reportPath := filepath.Join(cwd, fileName)
+	reportPath := filepath.Join(reportDir, fileName)
 	if werr := os.WriteFile(reportPath, []byte(report), 0o644); werr != nil {
 		result.Err = &ToolError{ErrorCode: "execution_error", Message: "write report: " + werr.Error()}
 		result.Duration = time.Since(start)
@@ -6443,7 +6477,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_compliance_report",
-			Description: "Aggregates a batch upgrade's results into a CISO-shareable markdown report and writes it to compliance-report-<timestamp>.md in the current directory. Pure local transformation — pass the JSON array of batch results from a prior batch upgrade run as `results`. Returns { org, generated_at, target_version, summary{total_workspaces,upgraded,skipped,failed,noop,cves_resolved,cve_ids_resolved}, upgraded_workspaces, skipped_workspaces, failed_workspaces, report_markdown, report_path }. Read-only with respect to HCP Terraform; writes to local disk only.",
+			Description: "Aggregates a batch upgrade's results into a CISO-shareable markdown report and writes it to compliance-report-<timestamp>.md. By default writes to the current working directory; pass output_dir to redirect (created if missing, leading ~ expanded). Pure local transformation — pass the JSON array of batch results from a prior batch upgrade run as `results`. Returns { org, generated_at, target_version, summary{total_workspaces,upgraded,skipped,failed,noop,cves_resolved,cve_ids_resolved}, upgraded_workspaces, skipped_workspaces, failed_workspaces, report_markdown, report_path }. Read-only with respect to HCP Terraform; writes to local disk only.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -6451,6 +6485,7 @@ func Definitions() []ToolDef {
 					"results":        map[string]any{"type": "string", "description": "JSON array of batch results: [{workspace, previous_version, new_version, status, risk_score, cves_resolved[], run_id, error_code, duration_ms}]"},
 					"target_version": map[string]any{"type": "string", "description": "Optional target version annotated in the report header"},
 					"report_format":  map[string]any{"type": "string", "description": "Optional: \"markdown\" (default) or \"text\""},
+					"output_dir":     map[string]any{"type": "string", "description": "Optional output directory (e.g. \"~/.tfpilot/reports\"). Created if missing. Defaults to current working directory."},
 				},
 				"required": []string{"org", "results"},
 			},
