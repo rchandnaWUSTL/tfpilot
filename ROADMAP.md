@@ -161,10 +161,15 @@ Note: Revisit adopting opencode's provider framework when a third provider is ne
 - Resolves Issue 3 from the post-v1.5 audit: "is it safe to upgrade?" returns a real risk score, blast radius, CVE diff, and breaking-changes summary grounded in the user's workspace, never generic advice.
 - Constraint: the workspace's HCL must be in the tool's `config_path` (defaults to cwd). VCS-only workspaces and configurations the user does not have locally surface an `unsupported_operation` error explaining the requirement.
 
-## v1.7 — Plan Analyzer v2
-- `how_to_reduce_risk` field per risk factor: concrete, actionable suggestions for making a High or Critical plan safer before applying
-- Registry integration for module version context: surfaces whether a module version in the plan has known issues or a newer release
-- Risk factor explanations written for the operator, not just the model — readable in the REPL without post-processing
+## v1.7 — Batch Remediation and Compliance Reporting (In Progress)
+- _hcp_tf_batch_upgrade tool: builds a prioritized upgrade queue from a comma-separated list of vulnerable workspaces. Mutating; the REPL drives sequential execution. Sort key: highest CVE severity → most resources → "prod" substring → name. Auto-flags workspaces with > 50 resources or destructive last runs as risk_flag. Returns the queue only — execution happens in the REPL loop.
+- Batch execution loop in REPL: walks the queue calling _hcp_tf_version_upgrade → _hcp_tf_plan_analyze → _hcp_tf_run_apply per workspace. A single approval gate per workspace covers the full chain; destructions > 0 still triggers the existing second-confirm even in batch mode.
+- Approval options: yes, yes to all, skip, stop. risk_flag workspaces always re-prompt regardless of "yes to all" — "all" is rejected on high-risk entries to prevent runaway on dangerous workspaces.
+- Live progress rendering: [N/Total] workspace (from → to) ✓ applied — RISK risk, with HashiCorp brand color coding (waypointTeal applied, vaultYellow warnings, dimWhite skipped, boundaryPink failed).
+- _hcp_tf_compliance_report tool: aggregates a batch's per-workspace results into a structured envelope plus a markdown report (executive summary, upgraded/skipped/failed/no-op tables, CVE resolution list). Writes compliance-report-<timestamp>.md to cwd and returns the path. Read-only — pure local transformation.
+- /report slash command: regenerates the report from the last batch session without going through the agent. Re-runs the tool on r.lastBatchResults; useful when the auto-generated report needs to be refreshed.
+- After a batch finishes (completed, stopped, or all-skipped) the report is generated automatically — /report is the explicit retry path.
+- System prompt rule: "fix the rest" / "upgrade all" / "fix remaining" route to _hcp_tf_batch_upgrade with the workspace list from the prior version_audit; the agent emits exactly one acknowledgement sentence and never loops over workspaces itself.
 
 ## v1.8 — Observability and Metrics
 - Usage analytics: sessions per workspace, tool call frequency, apply success rates

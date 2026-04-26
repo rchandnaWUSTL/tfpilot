@@ -32,6 +32,7 @@ var MutatingTools = map[string]bool{
 	"_hcp_tf_upgrade_preview":    true,
 	"_hcp_tf_rollback":           true,
 	"_hcp_tf_version_upgrade":    true,
+	"_hcp_tf_batch_upgrade":      true,
 }
 
 // IsMutating reports whether a tool name triggers state changes.
@@ -1681,6 +1682,12 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_version_upgrade" {
 		return versionUpgradeCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_batch_upgrade" {
+		return batchUpgradeCall(ctx, args, timeoutSec)
+	}
+	if name == "_hcp_tf_compliance_report" {
+		return complianceReportCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -2170,6 +2177,420 @@ func versionUpgradeCall(ctx context.Context, args map[string]string, timeoutSec 
 	}
 	result.Output = json.RawMessage(encoded)
 	result.Duration = time.Since(start)
+	return result
+}
+
+// severityRank maps an OSV severity string to a sort weight; higher = worse.
+// Used by batchUpgradeCall to prioritize critical/high CVEs first.
+func severityRank(s string) int {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "critical":
+		return 4
+	case "high":
+		return 3
+	case "medium", "moderate":
+		return 2
+	case "low":
+		return 1
+	default:
+		return 0
+	}
+}
+
+// fetchLastRunDestructions returns the destruction count from a workspace's
+// most recent finished plan, or 0 if no plan exists or the plan read fails.
+// Used by batchUpgradeCall to flag workspaces whose previous run was
+// destructive — those get auto-paused for human review even in "yes to all"
+// mode.
+func fetchLastRunDestructions(ctx context.Context, org, workspace string, timeoutSec int) int {
+	wsRaw, err := fetchWorkspaceRead(ctx, org, workspace, timeoutSec)
+	if err != nil {
+		return 0
+	}
+	runID := extractCurrentRunID(wsRaw)
+	if runID == "" {
+		return 0
+	}
+	planRaw, perr := fetchHCPTFJSON(ctx, timeoutSec, "plan", "read", "-run-id="+runID, "-output=json")
+	if perr != nil {
+		return 0
+	}
+	return decodePlanCounts(planRaw).destructions
+}
+
+// batchUpgradeCall builds a prioritized upgrade queue for the listed
+// workspaces. It does NOT execute the upgrades — the REPL drives the
+// per-workspace approval loop. Marked mutating so the readonly-mode filter
+// excludes it; the queue itself is read-only, but every queued workspace
+// will be mutated as the REPL walks the loop.
+func batchUpgradeCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_batch_upgrade", Args: args}
+
+	if err := require(args, "org", "workspaces", "target_version"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	targetVersion := args["target_version"]
+	mode := strings.TrimSpace(args["mode"])
+	if mode == "" {
+		mode = "interactive"
+	}
+
+	requested := []string{}
+	seen := map[string]bool{}
+	for _, raw := range strings.Split(args["workspaces"], ",") {
+		name := strings.TrimSpace(raw)
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		requested = append(requested, name)
+	}
+	if len(requested) == 0 {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: "workspaces must contain at least one workspace name"}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	auditResult := versionAuditCall(ctx, map[string]string{"org": org}, timeoutSec)
+	if auditResult.Err != nil {
+		result.Err = auditResult.Err
+		result.Duration = time.Since(start)
+		return result
+	}
+	var auditOut struct {
+		VersionSummary []summaryEntry `json:"version_summary"`
+	}
+	if err := json.Unmarshal(auditResult.Output, &auditOut); err != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: "decode audit output: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	type wsAudit struct {
+		version  string
+		cves     []advisoryEntry
+		severity string
+	}
+	auditByName := map[string]wsAudit{}
+	for _, group := range auditOut.VersionSummary {
+		highest := highestSeverity(group.KnownCVEs)
+		for _, name := range group.Workspaces {
+			auditByName[name] = wsAudit{version: group.TerraformVersion, cves: group.KnownCVEs, severity: highest}
+		}
+	}
+
+	wsListResult := workspacesListCall(ctx, map[string]string{"org": org}, timeoutSec)
+	resourceCount := map[string]int{}
+	if wsListResult.Err == nil {
+		var workspaces []map[string]any
+		if err := json.Unmarshal(wsListResult.Output, &workspaces); err == nil {
+			for _, ws := range workspaces {
+				name := firstStringField(ws, "name", "Name")
+				if name == "" {
+					continue
+				}
+				resourceCount[name] = firstIntField(ws, "resource_count", "ResourceCount", "resource-count")
+			}
+		}
+	}
+
+	type queueEntry struct {
+		Workspace       string `json:"workspace"`
+		CurrentVersion  string `json:"current_version"`
+		TargetVersion   string `json:"target_version"`
+		CVECount        int    `json:"cve_count"`
+		HighestSeverity string `json:"highest_severity"`
+		CVEIDs          []string `json:"cve_ids,omitempty"`
+		ResourceCount   int    `json:"resource_count"`
+		LastDestroys    int    `json:"last_run_destructions"`
+		RiskFlag        bool   `json:"risk_flag"`
+		Priority        int    `json:"priority"`
+	}
+
+	entries := make([]queueEntry, len(requested))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 8)
+	for i, name := range requested {
+		i := i
+		name := name
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			audit, hasAudit := auditByName[name]
+			ids := make([]string, 0, len(audit.cves))
+			for _, c := range audit.cves {
+				ids = append(ids, c.ID)
+			}
+			rc := resourceCount[name]
+			destroys := fetchLastRunDestructions(ctx, org, name, timeoutSec)
+			version := audit.version
+			if !hasAudit || version == "" {
+				version = "unknown"
+			}
+			entries[i] = queueEntry{
+				Workspace:       name,
+				CurrentVersion:  version,
+				TargetVersion:   targetVersion,
+				CVECount:        len(audit.cves),
+				HighestSeverity: audit.severity,
+				CVEIDs:          ids,
+				ResourceCount:   rc,
+				LastDestroys:    destroys,
+				RiskFlag:        rc > 50 || destroys > 0,
+			}
+		}()
+	}
+	wg.Wait()
+
+	sort.SliceStable(entries, func(i, j int) bool {
+		ri := severityRank(entries[i].HighestSeverity)
+		rj := severityRank(entries[j].HighestSeverity)
+		if ri != rj {
+			return ri > rj
+		}
+		if entries[i].ResourceCount != entries[j].ResourceCount {
+			return entries[i].ResourceCount > entries[j].ResourceCount
+		}
+		ip := strings.Contains(strings.ToLower(entries[i].Workspace), "prod")
+		jp := strings.Contains(strings.ToLower(entries[j].Workspace), "prod")
+		if ip != jp {
+			return ip
+		}
+		return entries[i].Workspace < entries[j].Workspace
+	})
+	for i := range entries {
+		entries[i].Priority = i + 1
+	}
+
+	out := map[string]any{
+		"org":            org,
+		"target_version": targetVersion,
+		"mode":           mode,
+		"total":          len(entries),
+		"queue":          entries,
+	}
+	body, mErr := json.Marshal(out)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(body)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// batchResultIn is the shape the REPL hands to the compliance report tool —
+// one entry per workspace the batch loop touched.
+type batchResultIn struct {
+	Workspace       string   `json:"workspace"`
+	PreviousVersion string   `json:"previous_version"`
+	NewVersion      string   `json:"new_version"`
+	Status          string   `json:"status"`
+	RiskScore       string   `json:"risk_score"`
+	CVEsResolved    []string `json:"cves_resolved"`
+	RunID           string   `json:"run_id"`
+	ErrorCode       string   `json:"error_code"`
+	DurationMs      int64    `json:"duration_ms"`
+}
+
+// complianceReportCall aggregates a batch upgrade's per-workspace results
+// into a markdown report suitable for sharing with a CISO. Writes the
+// markdown to the current directory as compliance-report-<timestamp>.md
+// and returns the path. Pure local transformation — no HCP Terraform calls.
+func complianceReportCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_compliance_report", Args: args}
+
+	if err := require(args, "org", "results"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var rows []batchResultIn
+	if err := json.Unmarshal([]byte(args["results"]), &rows); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: "results must be a JSON array of batch result entries: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	upgraded := []batchResultIn{}
+	skipped := []batchResultIn{}
+	failed := []batchResultIn{}
+	noop := []batchResultIn{}
+	cveSet := map[string]bool{}
+	for _, r := range rows {
+		switch r.Status {
+		case "applied":
+			upgraded = append(upgraded, r)
+			for _, id := range r.CVEsResolved {
+				if id != "" {
+					cveSet[id] = true
+				}
+			}
+		case "noop":
+			noop = append(noop, r)
+		case "skipped":
+			skipped = append(skipped, r)
+		case "failed":
+			failed = append(failed, r)
+		}
+	}
+	cveIDs := make([]string, 0, len(cveSet))
+	for id := range cveSet {
+		cveIDs = append(cveIDs, id)
+	}
+	sort.Strings(cveIDs)
+
+	now := time.Now().UTC()
+	generatedAt := now.Format(time.RFC3339)
+	humanDate := now.Format("January 2, 2006")
+	targetVersion := strings.TrimSpace(args["target_version"])
+
+	var b strings.Builder
+	b.WriteString("# Infrastructure Security Compliance Report\n")
+	fmt.Fprintf(&b, "**Organization:** %s  \n", args["org"])
+	fmt.Fprintf(&b, "**Generated:** %s  \n", humanDate)
+	if targetVersion != "" {
+		fmt.Fprintf(&b, "**Target Terraform Version:** %s  \n", targetVersion)
+	}
+	b.WriteString("**Reviewed by:** tfpilot\n\n")
+
+	b.WriteString("## Executive Summary\n")
+	totalUpgraded := len(upgraded) + len(noop)
+	switch {
+	case totalUpgraded > 0 && len(failed) == 0 && len(skipped) == 0:
+		fmt.Fprintf(&b, "%d of %d workspaces upgraded", totalUpgraded, len(rows))
+		if targetVersion != "" {
+			fmt.Fprintf(&b, " to Terraform %s", targetVersion)
+		}
+		b.WriteString(".")
+	default:
+		fmt.Fprintf(&b, "%d of %d workspaces upgraded", totalUpgraded, len(rows))
+		if targetVersion != "" {
+			fmt.Fprintf(&b, " to Terraform %s", targetVersion)
+		}
+		fmt.Fprintf(&b, ", %d skipped, %d failed.", len(skipped), len(failed))
+	}
+	if len(cveIDs) > 0 {
+		fmt.Fprintf(&b, " %s resolved across all upgraded workspaces.", strings.Join(cveIDs, ", "))
+	}
+	b.WriteString("\n\n")
+
+	b.WriteString(fmt.Sprintf("## Workspaces Upgraded (%d)\n", totalUpgraded))
+	if totalUpgraded == 0 {
+		b.WriteString("None.\n\n")
+	} else {
+		b.WriteString("| Workspace | Previous Version | New Version | Risk Score | CVEs Resolved |\n")
+		b.WriteString("|-----------|-----------------|-------------|------------|---------------|\n")
+		for _, r := range upgraded {
+			cves := strings.Join(r.CVEsResolved, ", ")
+			if cves == "" {
+				cves = "—"
+			}
+			risk := r.RiskScore
+			if risk == "" {
+				risk = "Low"
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n", r.Workspace, r.PreviousVersion, r.NewVersion, risk, cves)
+		}
+		for _, r := range noop {
+			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n", r.Workspace, r.PreviousVersion, r.NewVersion, "noop (constraint only)", "—")
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(fmt.Sprintf("## Workspaces Skipped (%d)\n", len(skipped)))
+	if len(skipped) == 0 {
+		b.WriteString("None.\n\n")
+	} else {
+		b.WriteString("| Workspace | Reason |\n|-----------|--------|\n")
+		for _, r := range skipped {
+			reason := r.ErrorCode
+			if reason == "" {
+				reason = "skipped by user"
+			}
+			fmt.Fprintf(&b, "| %s | %s |\n", r.Workspace, reason)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString(fmt.Sprintf("## Workspaces Failed (%d)\n", len(failed)))
+	if len(failed) == 0 {
+		b.WriteString("None.\n\n")
+	} else {
+		b.WriteString("| Workspace | Error |\n|-----------|-------|\n")
+		for _, r := range failed {
+			err := r.ErrorCode
+			if err == "" {
+				err = "unknown"
+			}
+			fmt.Fprintf(&b, "| %s | %s |\n", r.Workspace, err)
+		}
+		b.WriteString("\n")
+	}
+
+	b.WriteString("## CVEs Resolved\n")
+	if len(cveIDs) == 0 {
+		b.WriteString("No CVEs were associated with the upgraded workspaces in this batch.\n")
+	} else {
+		for _, id := range cveIDs {
+			fmt.Fprintf(&b, "- **%s** — resolved in upgraded workspaces.\n", id)
+		}
+	}
+
+	report := b.String()
+
+	cwd, _ := os.Getwd()
+	if cwd == "" {
+		cwd = "."
+	}
+	fileName := fmt.Sprintf("compliance-report-%s.md", strings.ReplaceAll(now.Format("2006-01-02T15-04-05Z"), ":", "-"))
+	reportPath := filepath.Join(cwd, fileName)
+	if werr := os.WriteFile(reportPath, []byte(report), 0o644); werr != nil {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "write report: " + werr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	out := map[string]any{
+		"org":            args["org"],
+		"generated_at":   generatedAt,
+		"target_version": targetVersion,
+		"summary": map[string]any{
+			"total_workspaces": len(rows),
+			"upgraded":         len(upgraded),
+			"noop":             len(noop),
+			"skipped":          len(skipped),
+			"failed":           len(failed),
+			"cves_resolved":    len(cveIDs),
+			"cve_ids_resolved": cveIDs,
+		},
+		"upgraded_workspaces": upgraded,
+		"skipped_workspaces":  skipped,
+		"failed_workspaces":   failed,
+		"noop_workspaces":     noop,
+		"report_markdown":     report,
+		"report_path":         reportPath,
+	}
+	body, mErr := json.Marshal(out)
+	if mErr != nil {
+		result.Err = &ToolError{ErrorCode: "marshal_error", Message: mErr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(body)
+	result.Duration = time.Since(start)
+	_ = ctx
+	_ = timeoutSec
 	return result
 }
 
@@ -5600,6 +6021,34 @@ func Definitions() []ToolDef {
 					"target_version": map[string]any{"type": "string", "description": "Target Terraform version, e.g. \"1.14.9\""},
 				},
 				"required": []string{"org", "workspace", "target_version"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_batch_upgrade",
+			Description: "Builds a prioritized upgrade queue from a comma-separated list of vulnerable workspaces. Returns { org, target_version, mode, total, queue[{workspace, current_version, target_version, cve_count, highest_severity, cve_ids, resource_count, last_run_destructions, risk_flag, priority}] }. Sort key: highest CVE severity, then most resources, then \"prod\" substring. risk_flag is true when resource_count > 50 or last_run_destructions > 0; the REPL auto-pauses for risk_flag workspaces regardless of mode. The tool does not execute upgrades — the REPL drives the per-workspace approval loop, calling _hcp_tf_version_upgrade per entry. Mutating — only available when --apply is set, because every queued workspace will be mutated during the loop.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":            map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspaces":     map[string]any{"type": "string", "description": "Comma-separated list of workspace names to queue for upgrade"},
+					"target_version": map[string]any{"type": "string", "description": "Target Terraform version, e.g. \"1.14.9\""},
+					"mode":           map[string]any{"type": "string", "description": "Optional: \"interactive\" (default) or \"auto\". Recorded in output; the REPL still pauses for risk_flag workspaces regardless of mode."},
+				},
+				"required": []string{"org", "workspaces", "target_version"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_compliance_report",
+			Description: "Aggregates a batch upgrade's results into a CISO-shareable markdown report and writes it to compliance-report-<timestamp>.md in the current directory. Pure local transformation — pass the JSON array of batch results from a prior batch upgrade run as `results`. Returns { org, generated_at, target_version, summary{total_workspaces,upgraded,skipped,failed,noop,cves_resolved,cve_ids_resolved}, upgraded_workspaces, skipped_workspaces, failed_workspaces, report_markdown, report_path }. Read-only with respect to HCP Terraform; writes to local disk only.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":            map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"results":        map[string]any{"type": "string", "description": "JSON array of batch results: [{workspace, previous_version, new_version, status, risk_score, cves_resolved[], run_id, error_code, duration_ms}]"},
+					"target_version": map[string]any{"type": "string", "description": "Optional target version annotated in the report header"},
+					"report_format":  map[string]any{"type": "string", "description": "Optional: \"markdown\" (default) or \"text\""},
+				},
+				"required": []string{"org", "results"},
 			},
 		},
 		{

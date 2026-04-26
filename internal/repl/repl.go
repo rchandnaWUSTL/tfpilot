@@ -54,6 +54,11 @@ type REPL struct {
 	discardedRuns   map[string]bool
 	rl              *readline.Instance
 	activeSpin      *toolSpinner
+
+	batchActive      bool
+	batchAutoApprove bool
+	pendingBatch     json.RawMessage
+	lastBatchResults []batchResult
 }
 
 func New(cfg *config.Config, prov provider.Provider, org, workspace string) *REPL {
@@ -169,6 +174,8 @@ func (r *REPL) handleSlash(cmd string) (exit bool) {
 		r.handleProviders()
 	case "/upgrade":
 		r.handleUpgrade(parts[1:])
+	case "/report":
+		r.handleReport()
 	case "/workspaces":
 		r.handleWorkspaces(parts[1:])
 	default:
@@ -295,6 +302,7 @@ func (r *REPL) ask(userMsg string) {
 	}
 
 	r.handleGeneratedConfig(ctx, full.String())
+	r.maybeRunBatchUpgrade(ctx)
 }
 
 // recordToolResult captures the last successful plan_summary and run_create
@@ -317,6 +325,8 @@ func (r *REPL) recordToolResult(name string, result *tools.CallResult) {
 		if id := result.Args["run_id"]; id != "" {
 			r.discardedRuns[id] = true
 		}
+	case "_hcp_tf_batch_upgrade":
+		r.pendingBatch = result.Output
 	}
 }
 
@@ -331,6 +341,27 @@ func (r *REPL) approveMutation(name string, args map[string]string) bool {
 	// Stop spinner so it doesn't race with the approval prompt
 	if r.activeSpin != nil {
 		r.activeSpin.pause()
+	}
+
+	// During a batch upgrade, the per-workspace approval already authorized
+	// the full chain. Auto-approve mutating tools — except run_apply with
+	// destructions > 0 still demands an explicit confirmation, so the
+	// invariant "destructive applies are never silent" holds even in batch
+	// mode.
+	if r.batchActive {
+		if name == "_hcp_tf_run_apply" && r.destroysFromLastPlan() > 0 {
+			fmt.Println()
+			boundaryPink.Printf("  ✗ This plan will destroy %d resource(s) in %s. Type 'yes' to confirm destruction.\n", r.destroysFromLastPlan(), args["workspace"])
+			ok := r.readYes()
+			if r.activeSpin != nil && ok {
+				r.activeSpin.resume()
+			}
+			return ok
+		}
+		if r.activeSpin != nil {
+			r.activeSpin.resume()
+		}
+		return true
 	}
 
 	// Already-discarded runs get an automatic pass on follow-up discard calls
