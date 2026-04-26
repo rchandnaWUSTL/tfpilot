@@ -582,7 +582,7 @@ var categoryKeywords = []struct {
 }{
 	{"policy", []string{"policy check failed", "sentinel", "policy violation", " opa ", "opa policy"}},
 	{"quota", []string{"limitexceeded", "servicequotaexceeded", "quota exceeded", "limit exceeded"}},
-	{"auth", []string{"accessdenied", "unauthorized", "not authorized", " 403 ", "invalidclienttokenid", "signaturedoesnotmatch", "invalid credentials"}},
+	{"auth", []string{"accessdenied", "unauthorized", "not authorized", " 403 ", "invalidclienttokenid", "signaturedoesnotmatch", "invalid credentials", "expiredtoken", "expiredtokenexception", "requestexpired", "tokenrefreshrequired"}},
 	{"resource_conflict", []string{"alreadyexists", "already exists", "bucketalreadyownedbyyou", "duplicate resource", "conflict:"}},
 	{"network", []string{"dial tcp", "connection refused", "no route to host", "i/o timeout", "context deadline exceeded", "tls handshake"}},
 	{"provider", []string{"provider produced", "protorpc", "incompatible provider", "failed to install provider", "plugin did not respond"}},
