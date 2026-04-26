@@ -317,9 +317,10 @@ func planAnalyzeCall(ctx context.Context, args map[string]string, timeoutSec int
 	chRun := make(chan fetchResult, 1)
 	chRes := make(chan fetchResult, 1)
 	chPol := make(chan fetchResult, 1)
+	chCost := make(chan *costEstimate, 1)
 
 	var wg sync.WaitGroup
-	wg.Add(4)
+	wg.Add(5)
 	go func() {
 		defer wg.Done()
 		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "plan", "read", "-run-id="+runID, "-output=json")
@@ -340,11 +341,16 @@ func planAnalyzeCall(ctx context.Context, args map[string]string, timeoutSec int
 		raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, "policycheck", "list", "-run-id="+runID, "-output=json")
 		chPol <- fetchResult{raw: raw, err: ferr}
 	}()
+	go func() {
+		defer wg.Done()
+		chCost <- fetchCostEstimate(ctx, runID, timeoutSec)
+	}()
 	wg.Wait()
 	rPlan := <-chPlan
 	rRun := <-chRun
 	rRes := <-chRes
 	rPol := <-chPol
+	rCost := <-chCost
 
 	if rPlan.err != nil {
 		result.Err = rPlan.err
@@ -396,6 +402,18 @@ func planAnalyzeCall(ctx context.Context, args map[string]string, timeoutSec int
 	}
 	if reduction := riskReductionSuggestions(level, factors, plan); len(reduction) > 0 {
 		payload["how_to_reduce_risk"] = reduction
+	}
+	if rCost != nil {
+		payload["cost_estimate_available"] = true
+		payload["cost_estimate"] = map[string]any{
+			"prior_monthly_cost":    rCost.Prior,
+			"proposed_monthly_cost": rCost.Proposed,
+			"delta_monthly_cost":    rCost.Delta,
+			"delta_sign":            rCost.DeltaSign,
+			"summary":               rCost.Summary,
+		}
+	} else {
+		payload["cost_estimate_available"] = false
 	}
 
 	out, mErr := json.Marshal(payload)
@@ -1036,10 +1054,10 @@ func classifyRiskFactors(runResources []runResourceEntry, inventory []workspaceR
 	}
 
 	categories := []struct {
-		factor     string
-		severity   string
-		matchType  func(string) bool
-		severityN  int
+		factor    string
+		severity  string
+		matchType func(string) bool
+		severityN int
 	}{
 		{"IAM resource modification", "High", func(t string) bool { return strings.Contains(t, "iam") }, 3},
 		{"Security group change", "High", func(t string) bool { return strings.Contains(t, "security_group") }, 3},
@@ -3221,7 +3239,7 @@ func parseProviderAddress(addr string) (providerRef, bool) {
 	}
 	// Strip the optional `provider["..."]` wrapper.
 	if strings.HasPrefix(s, "provider[") && strings.HasSuffix(s, "]") {
-		inner := s[len("provider["):len(s)-1]
+		inner := s[len("provider[") : len(s)-1]
 		inner = strings.Trim(inner, `"`)
 		s = inner
 	}
@@ -4130,8 +4148,8 @@ func fetchOSVAdvisories(ctx context.Context, version string, timeoutSec int) ([]
 func parseOSVResponse(raw []byte) ([]advisoryEntry, bool) {
 	var wrapper struct {
 		Vulns []struct {
-			ID       string `json:"id"`
-			Summary  string `json:"summary"`
+			ID       string   `json:"id"`
+			Summary  string   `json:"summary"`
 			Aliases  []string `json:"aliases"`
 			Database struct {
 				Severity string `json:"severity"`

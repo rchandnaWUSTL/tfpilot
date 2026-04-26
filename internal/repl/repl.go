@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -30,11 +32,11 @@ var (
 	white        = color.New(color.FgWhite)
 	dimWhite     = color.New(color.FgWhite, color.Faint)
 	boldWhite    = color.New(color.FgWhite, color.Bold)
-	tfPurple     = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(99), color.Bold)  // HashiCorp Terraform #7B42BC
-	packerBlue   = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(39), color.Bold)  // HashiCorp Packer #02A8EF
-	waypointTeal = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(44))              // HashiCorp Waypoint #14C6CB
-	vaultYellow  = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(220))             // HashiCorp Vault #FFCF25
-	boundaryPink = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(203))             // HashiCorp Boundary #EC585D
+	tfPurple     = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(99), color.Bold) // HashiCorp Terraform #7B42BC
+	packerBlue   = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(39), color.Bold) // HashiCorp Packer #02A8EF
+	waypointTeal = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(44))             // HashiCorp Waypoint #14C6CB
+	vaultYellow  = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(220))            // HashiCorp Vault #FFCF25
+	boundaryPink = color.New(color.Attribute(38), color.Attribute(5), color.Attribute(203))            // HashiCorp Boundary #EC585D
 )
 
 type REPL struct {
@@ -1266,14 +1268,14 @@ func (r *REPL) handleDiagnose(args []string) {
 // REPL renders. Fields are optional — missing ones collapse to empty values so
 // the renderer can degrade gracefully on partial responses.
 type diagnosisResult struct {
-	runID       string
-	status      string
-	category    string
-	summary     string
-	detail      string
-	resources   []string
-	logSnippet  string
-	suggestFix  string
+	runID      string
+	status     string
+	category   string
+	summary    string
+	detail     string
+	resources  []string
+	logSnippet string
+	suggestFix string
 }
 
 func parseDiagnosis(raw json.RawMessage) diagnosisResult {
@@ -1365,18 +1367,22 @@ func renderDiagnosis(d diagnosisResult) {
 // REPL renders and branches on. The raw result is also preserved so /analyze
 // can print the full structure without re-running the tool.
 type assessmentResult struct {
-	runID          string
-	riskLevel      string
-	riskFactors    []assessmentFactor
-	blastRadius    assessmentBlastRadius
-	policyPresent  bool
-	policyTotal    int
-	policyPassed   int
-	policyFailed   bool
-	failedPolicies []string
-	recommendation string
-	reason         string
+	runID           string
+	riskLevel       string
+	riskFactors     []assessmentFactor
+	blastRadius     assessmentBlastRadius
+	policyPresent   bool
+	policyTotal     int
+	policyPassed    int
+	policyFailed    bool
+	failedPolicies  []string
+	recommendation  string
+	reason          string
 	howToReduceRisk []string
+	costAvailable   bool
+	costPrior       float64
+	costProposed    float64
+	costDelta       float64
 }
 
 type assessmentFactor struct {
@@ -1475,7 +1481,31 @@ func parseAssessment(raw json.RawMessage) assessmentResult {
 			}
 		}
 	}
+	if avail, ok := m["cost_estimate_available"].(bool); ok && avail {
+		if ce, ok := m["cost_estimate"].(map[string]any); ok {
+			a.costAvailable = true
+			a.costPrior = floatField(ce, "prior_monthly_cost")
+			a.costProposed = floatField(ce, "proposed_monthly_cost")
+			a.costDelta = floatField(ce, "delta_monthly_cost")
+		}
+	}
 	return a
+}
+
+func floatField(m map[string]any, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	case string:
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil {
+			return 0
+		}
+		return f
+	}
+	return 0
 }
 
 // renderAssessment prints the risk level, factors, blast radius, policy
@@ -1503,6 +1533,19 @@ func renderAssessment(a assessmentResult) {
 	}
 	fmt.Print("  ")
 	rc.Printf("Risk Level: %s\n", riskUpper)
+
+	if a.costAvailable {
+		switch {
+		case a.costDelta > 0:
+			vaultYellow.Printf("  💰 Cost change: +$%.2f/month (was $%.2f, now $%.2f)\n",
+				a.costDelta, a.costPrior, a.costProposed)
+		case a.costDelta < 0:
+			waypointTeal.Printf("  💰 Cost change: -$%.2f/month (was $%.2f, now $%.2f)\n",
+				math.Abs(a.costDelta), a.costPrior, a.costProposed)
+		default:
+			dimWhite.Printf("  💰 Cost change: none estimated\n")
+		}
+	}
 
 	if len(a.riskFactors) > 0 {
 		fmt.Println()
