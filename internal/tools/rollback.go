@@ -312,13 +312,14 @@ func parseTimeOrZero(s string) time.Time {
 	return t
 }
 
-// checkRollbackNoop polls a freshly-created rollback run for ~5 seconds,
-// returning true when HCP Terraform reports planned_and_finished — the status
-// HCP assigns when a plan completes with zero changes. We poll briefly because
-// no-op plans finalize almost immediately; real plans stay in pending/planning
-// long past this window and fall through to the standard plan_analyze flow.
+// checkRollbackNoop polls a freshly-created rollback run for up to 20 seconds
+// (10 attempts at 2-second intervals), returning true when HCP Terraform
+// reports planned_and_finished — the status HCP assigns when a plan completes
+// with zero changes. No-op plans typically finalize in 8–12 seconds; real
+// plans stay in pending/planning past this window and fall through to the
+// standard plan_analyze flow.
 func checkRollbackNoop(ctx context.Context, runID string, timeoutSec int) bool {
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for time.Now().Before(deadline) {
 		select {
 		case <-ctx.Done():
@@ -338,7 +339,7 @@ func checkRollbackNoop(ctx context.Context, runID string, timeoutSec int) bool {
 		case "errored", "canceled", "discarded":
 			return false
 		}
-		time.Sleep(1 * time.Second)
+		time.Sleep(2 * time.Second)
 	}
 	return false
 }
