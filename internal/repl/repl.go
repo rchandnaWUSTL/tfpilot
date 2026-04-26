@@ -49,6 +49,7 @@ type REPL struct {
 	lastRunID       string
 	discardedRuns   map[string]bool
 	rl              *readline.Instance
+	activeSpin      *toolSpinner
 }
 
 func New(cfg *config.Config, prov provider.Provider, org, workspace string) *REPL {
@@ -179,6 +180,7 @@ func (r *REPL) ask(userMsg string) {
 	ch, err := r.ag.Ask(ctx, userMsg, r.org, r.workspace,
 		func(ev agent.ToolCallEvent) {
 			spin = startToolSpinner(ev)
+			r.activeSpin = spin
 		},
 		func(name string, result *tools.CallResult) {
 			if spin != nil {
@@ -187,6 +189,7 @@ func (r *REPL) ask(userMsg string) {
 			} else {
 				printToolResult(name, result)
 			}
+			r.activeSpin = nil
 			sawToolResult.Store(true)
 			r.recordToolResult(name, result)
 		},
@@ -276,6 +279,11 @@ func (r *REPL) recordToolResult(name string, result *tools.CallResult) {
 // an apply, any previously-created run is discarded synchronously so it does
 // not remain pending in HCP Terraform.
 func (r *REPL) approveMutation(name string, args map[string]string) bool {
+	// Stop spinner so it doesn't race with the approval prompt
+	if r.activeSpin != nil {
+		r.activeSpin.pause()
+	}
+
 	// Already-discarded runs get an automatic pass on follow-up discard calls
 	// so the agent's "call discard on cancel" rule doesn't double-prompt.
 	if name == "_hcp_tf_run_discard" {
@@ -283,23 +291,31 @@ func (r *REPL) approveMutation(name string, args map[string]string) bool {
 		discarded := r.discardedRuns[args["run_id"]]
 		r.mu.Unlock()
 		if discarded {
+			if r.activeSpin != nil {
+				r.activeSpin.resume()
+			}
 			return true
 		}
 	}
 
+	var approved bool
 	if name == "_hcp_tf_run_apply" {
-		return r.applyGate(args)
+		approved = r.applyGate(args)
+	} else {
+		action := describeAction(name, args)
+		fmt.Println()
+		vaultYellow.Printf("  ⚠ This will %s. Type 'yes' to confirm or anything else to cancel.\n", action)
+		approved = r.readYes()
+		if !approved {
+			r.onMutationCancelled(name, args)
+		}
 	}
 
-	action := describeAction(name, args)
-	fmt.Println()
-	vaultYellow.Printf("  ⚠ This will %s. Type 'yes' to confirm or anything else to cancel.\n", action)
-
-	if !r.readYes() {
-		r.onMutationCancelled(name, args)
-		return false
+	// Resume spinner only if approved — tool is about to execute
+	if approved && r.activeSpin != nil {
+		r.activeSpin.resume()
 	}
-	return true
+	return approved
 }
 
 // applyGate runs _hcp_tf_plan_analyze, renders the risk assessment, and
@@ -1764,10 +1780,11 @@ func (r *REPL) offerDirectApply(ctx context.Context, validateResult *tools.CallR
 var spinnerFrames = []string{"|", "/", "-", "\\"}
 
 type toolSpinner struct {
-	stop chan struct{}
-	done chan struct{}
-	name string
-	args string
+	stop   chan struct{}
+	done   chan struct{}
+	name   string
+	args   string
+	paused bool
 }
 
 func startToolSpinner(ev agent.ToolCallEvent) *toolSpinner {
@@ -1810,9 +1827,45 @@ func (s *toolSpinner) render(frame string) {
 	}
 }
 
-func (s *toolSpinner) finish(name string, result *tools.CallResult) {
+func (s *toolSpinner) pause() {
+	if s.paused {
+		return
+	}
+	s.paused = true
 	close(s.stop)
 	<-s.done
+	fmt.Print("\r\033[2K")
+}
+
+func (s *toolSpinner) resume() {
+	if !s.paused {
+		return
+	}
+	s.paused = false
+	s.stop = make(chan struct{})
+	s.done = make(chan struct{})
+	go func() {
+		defer close(s.done)
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		i := 0
+		for {
+			select {
+			case <-s.stop:
+				return
+			case <-ticker.C:
+				i = (i + 1) % len(spinnerFrames)
+				s.render(spinnerFrames[i])
+			}
+		}
+	}()
+}
+
+func (s *toolSpinner) finish(name string, result *tools.CallResult) {
+	if !s.paused {
+		close(s.stop)
+		<-s.done
+	}
 	fmt.Print("\r\033[2K")
 	printToolResult(name, result)
 }
