@@ -31,6 +31,7 @@ var MutatingTools = map[string]bool{
 	"_hcp_tf_workspace_populate": true,
 	"_hcp_tf_upgrade_preview":    true,
 	"_hcp_tf_rollback":           true,
+	"_hcp_tf_version_upgrade":    true,
 }
 
 // IsMutating reports whether a tool name triggers state changes.
@@ -1677,6 +1678,9 @@ func callDispatch(ctx context.Context, name string, args map[string]string, time
 	if name == "_hcp_tf_workspace_dependencies" {
 		return workspaceDependenciesCall(ctx, args, timeoutSec)
 	}
+	if name == "_hcp_tf_version_upgrade" {
+		return versionUpgradeCall(ctx, args, timeoutSec)
+	}
 
 	start := time.Now()
 	result := &CallResult{ToolName: name, Args: args}
@@ -2074,6 +2078,65 @@ func workspacePopulateCall(ctx context.Context, args map[string]string, timeoutS
 	encoded, merr := json.Marshal(out)
 	if merr != nil {
 		result.Err = &ToolError{ErrorCode: "execution_error", Message: "marshal populate result: " + merr.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	result.Output = json.RawMessage(encoded)
+	result.Duration = time.Since(start)
+	return result
+}
+
+// versionUpgradeCall bumps a workspace's Terraform required_version to
+// target_version by generating a minimal terraform{} HCL stub and routing
+// through workspacePopulateCall. The caller is expected to chain into
+// _hcp_tf_plan_analyze on the returned run_id and obtain explicit user
+// approval before _hcp_tf_run_apply runs.
+func versionUpgradeCall(ctx context.Context, args map[string]string, timeoutSec int) *CallResult {
+	start := time.Now()
+	result := &CallResult{ToolName: "_hcp_tf_version_upgrade", Args: args}
+
+	if err := require(args, "org", "workspace", "target_version"); err != nil {
+		result.Err = &ToolError{ErrorCode: "invalid_tool", Message: err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+	org := args["org"]
+	workspace := args["workspace"]
+	targetVersion := args["target_version"]
+
+	hcl := fmt.Sprintf("terraform {\n  required_version = \"~> %s\"\n}\n", targetVersion)
+
+	populateArgs := map[string]string{
+		"org":       org,
+		"workspace": workspace,
+		"config":    hcl,
+		"message":   fmt.Sprintf("tfpilot: upgrade Terraform to %s", targetVersion),
+	}
+	populated := workspacePopulateCall(ctx, populateArgs, timeoutSec)
+	if populated.Err != nil {
+		result.Err = populated.Err
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	var inner map[string]any
+	if err := json.Unmarshal(populated.Output, &inner); err != nil {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "decode populate output: " + err.Error()}
+		result.Duration = time.Since(start)
+		return result
+	}
+
+	out := map[string]any{
+		"org":            org,
+		"workspace":      workspace,
+		"target_version": targetVersion,
+		"run_id":         inner["run_id"],
+		"status":         inner["status"],
+		"message":        "Version bump config uploaded and plan triggered. Call _hcp_tf_plan_analyze with this run_id to assess risk before applying.",
+	}
+	encoded, merr := json.Marshal(out)
+	if merr != nil {
+		result.Err = &ToolError{ErrorCode: "execution_error", Message: "marshal upgrade result: " + merr.Error()}
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -5474,6 +5537,19 @@ func Definitions() []ToolDef {
 					"message":   map[string]any{"type": "string", "description": "Optional run message (default: \"tfpilot: initial resource provisioning\")"},
 				},
 				"required": []string{"org", "workspace", "config"},
+			},
+		},
+		{
+			Name:        "_hcp_tf_version_upgrade",
+			Description: "Upgrades a workspace's Terraform required_version by generating a minimal terraform{} HCL stub (`terraform { required_version = \"~> <target_version>\" }`), uploading it as a new configuration version, and triggering a run. Returns { org, workspace, target_version, run_id, status, message }. Because the uploaded config contains only the terraform block, the resulting plan will propose to destroy any existing resources alongside the version bump — the caller MUST chain into _hcp_tf_plan_analyze on run_id and obtain explicit user approval before _hcp_tf_run_apply. Mutating — only available when --apply is set.",
+			InputSchema: map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"org":            map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"workspace":      map[string]any{"type": "string", "description": "Target workspace name"},
+					"target_version": map[string]any{"type": "string", "description": "Target Terraform version, e.g. \"1.14.9\""},
+				},
+				"required": []string{"org", "workspace", "target_version"},
 			},
 		},
 		{
