@@ -9,6 +9,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -2064,6 +2065,26 @@ func (r *REPL) offerDirectApply(ctx context.Context, validateResult *tools.CallR
 
 var spinnerFrames = []string{"|", "/", "-", "\\"}
 
+// truncateSpinnerArgs renders the tool's args for the spinner display,
+// capped at 80 characters with an ellipsis. The carriage-return + clear-line
+// trick the spinner uses only resets the cursor to the start of the current
+// terminal row — when args wrap across rows (a comma-separated workspace
+// list of 88 entries hits ~1500 columns on a typical terminal), every tick
+// leaves the wrapped tail behind and the screen fills with stale lines.
+// The full args still land in ~/.tfpilot/audit.log via writeAuditLog.
+func truncateSpinnerArgs(args map[string]string) string {
+	parts := make([]string, 0, len(args))
+	for k, v := range args {
+		parts = append(parts, fmt.Sprintf("%s=%s", k, v))
+	}
+	sort.Strings(parts)
+	s := strings.Join(parts, " ")
+	if len(s) > 80 {
+		return s[:77] + "..."
+	}
+	return s
+}
+
 type toolSpinner struct {
 	stop   chan struct{}
 	done   chan struct{}
@@ -2073,15 +2094,11 @@ type toolSpinner struct {
 }
 
 func startToolSpinner(ev agent.ToolCallEvent) *toolSpinner {
-	argParts := make([]string, 0, len(ev.Args))
-	for k, v := range ev.Args {
-		argParts = append(argParts, fmt.Sprintf("%s=%s", k, v))
-	}
 	s := &toolSpinner{
 		stop: make(chan struct{}),
 		done: make(chan struct{}),
 		name: ev.Name,
-		args: strings.Join(argParts, " "),
+		args: truncateSpinnerArgs(ev.Args),
 	}
 	s.render(spinnerFrames[0])
 	go func() {
