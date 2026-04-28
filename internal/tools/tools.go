@@ -1919,6 +1919,49 @@ func workspaceCreateCall(ctx context.Context, args map[string]string, timeoutSec
 	if tv := strings.TrimSpace(args["terraform_version"]); tv != "" {
 		cmdArgs = append(cmdArgs, "-terraform-version="+tv)
 	}
+
+	executionMode := strings.ToLower(strings.TrimSpace(args["execution_mode"]))
+	agentPoolID := strings.TrimSpace(args["agent_pool_id"])
+	if executionMode != "" {
+		switch executionMode {
+		case "remote", "local", "agent":
+		default:
+			result.Err = &ToolError{
+				ErrorCode: "invalid_tool",
+				Message:   fmt.Sprintf("execution_mode must be one of remote, local, agent (got %q)", executionMode),
+			}
+			result.Duration = time.Since(start)
+			return result
+		}
+		if executionMode == "agent" && agentPoolID == "" {
+			result.Err = &ToolError{
+				ErrorCode: "invalid_tool",
+				Message:   "agent_pool_id is required when execution_mode is \"agent\"",
+			}
+			result.Duration = time.Since(start)
+			return result
+		}
+		if executionMode != "agent" && agentPoolID != "" {
+			result.Err = &ToolError{
+				ErrorCode: "invalid_tool",
+				Message:   "agent_pool_id is only valid when execution_mode is \"agent\"",
+			}
+			result.Duration = time.Since(start)
+			return result
+		}
+		cmdArgs = append(cmdArgs, "-execution-mode="+executionMode)
+		if agentPoolID != "" {
+			cmdArgs = append(cmdArgs, "-agent-pool-id="+agentPoolID)
+		}
+	} else if agentPoolID != "" {
+		result.Err = &ToolError{
+			ErrorCode: "invalid_tool",
+			Message:   "agent_pool_id requires execution_mode=\"agent\"",
+		}
+		result.Duration = time.Since(start)
+		return result
+	}
+
 	cmdArgs = append(cmdArgs, "-output=json")
 
 	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, cmdArgs...)
@@ -1950,6 +1993,16 @@ func workspaceCreateCall(ctx context.Context, args map[string]string, timeoutSec
 	}
 	if v, ok := parsed["TerraformVersion"]; ok && v != nil && v != "" {
 		out["terraform_version"] = v
+	}
+	if v, ok := parsed["ExecutionMode"]; ok && v != nil && v != "" {
+		out["execution_mode"] = v
+	} else if executionMode != "" {
+		out["execution_mode"] = executionMode
+	}
+	if v, ok := parsed["AgentPoolID"]; ok && v != nil && v != "" {
+		out["agent_pool_id"] = v
+	} else if agentPoolID != "" {
+		out["agent_pool_id"] = agentPoolID
 	}
 	if projectID != "" {
 		out["project_id"] = projectID
@@ -6426,7 +6479,7 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_workspace_create",
-			Description: "Creates a new HCP Terraform workspace in an organization, optionally within a named project. Returns { workspace_id, name, org, project, url }. Mutating — only available when --apply is set. The caller must obtain explicit user approval before calling this tool.",
+			Description: "Creates a new HCP Terraform workspace in an organization, optionally within a named project. Returns { workspace_id, name, org, project, execution_mode, agent_pool_id, url }. Mutating — only available when --apply is set. The caller must obtain explicit user approval before calling this tool.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -6436,6 +6489,8 @@ func Definitions() []ToolDef {
 					"project_id":        map[string]any{"type": "string", "description": "Optional project ID (prj-xxx). Overrides project when both are set."},
 					"description":       map[string]any{"type": "string", "description": "Optional human description for the workspace"},
 					"terraform_version": map[string]any{"type": "string", "description": "Optional Terraform version constraint, e.g. \"~>1.0\""},
+					"execution_mode":    map[string]any{"type": "string", "enum": []string{"remote", "local", "agent"}, "description": "Optional workspace execution mode. \"remote\" (default) runs plans and applies on HCP Terraform; \"local\" only stores state and runs Terraform on the operator's machine; \"agent\" routes runs through a self-hosted agent pool and requires agent_pool_id."},
+					"agent_pool_id":     map[string]any{"type": "string", "description": "Agent pool ID (apool-xxx). Required when execution_mode is \"agent\" and forbidden otherwise."},
 				},
 				"required": []string{"org", "name"},
 			},

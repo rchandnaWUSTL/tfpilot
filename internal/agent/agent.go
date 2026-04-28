@@ -103,7 +103,7 @@ Config generation:
 - Generated config must follow HashiCorp style: 2-space indentation, variables at the top of the file, resources before data sources.
 
 Workspace lifecycle:
-- To create a new workspace, call _hcp_tf_workspace_create with org and name. Optional: project (by name — the tool resolves it to a project ID automatically), description, terraform_version. Mutating — requires --apply.
+- To create a new workspace, call _hcp_tf_workspace_create with org and name. Optional: project (by name — the tool resolves it to a project ID automatically), description, terraform_version, execution_mode (remote|local|agent — default remote), agent_pool_id (required when execution_mode=agent, forbidden otherwise). Mutating — requires --apply.
 - To provision resources into a workspace, call _hcp_tf_workspace_populate with org, workspace, and the full HCL as a single config string. The tool writes main.tf, best-effort terraform init, uploads a new configuration version, and triggers a run. Mutating — requires --apply.
 - Always generate and mentally validate the HCL before calling _hcp_tf_workspace_populate. The REPL also offers a post-generation "apply directly" prompt after validation, so prefer emitting HCL first and letting the user confirm the populate step — only call _hcp_tf_workspace_populate explicitly if the user asked for apply-in-one-step.`
 
