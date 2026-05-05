@@ -4,7 +4,7 @@
 
 ![tfpilot demo](demo-mini-v2.gif)
 
-```bash
+Coming soon: ```bash
 brew install tfpilot
 ```
 
