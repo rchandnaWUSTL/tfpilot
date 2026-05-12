@@ -1961,7 +1961,27 @@ func workspaceCreateCall(ctx context.Context, args map[string]string, timeoutSec
 		result.Duration = time.Since(start)
 		return result
 	}
-
+	if wd := strings.TrimSpace(args["working_directory"]); wd != "" {
+		cmdArgs = append(cmdArgs, "-working-directory="+wd)
+	}
+	if args["auto_apply"] == "true" {
+		cmdArgs = append(cmdArgs, "-auto-apply")
+	}
+	if vi := strings.TrimSpace(args["vcs_identifier"]); vi != "" {
+		cmdArgs = append(cmdArgs, "-vcs-identifier="+vi)
+	}
+	if vb := strings.TrimSpace(args["vcs_branch"]); vb != "" {
+		cmdArgs = append(cmdArgs, "-vcs-branch="+vb)
+	}
+	if vt := strings.TrimSpace(args["vcs_oauth_token_id"]); vt != "" {
+		cmdArgs = append(cmdArgs, "-vcs-oauth-token-id="+vt)
+	}
+	if args["global_remote_state"] == "true" {
+		cmdArgs = append(cmdArgs, "-global-remote-state=true")
+	}
+	if tg := strings.TrimSpace(args["tags"]); tg != "" {
+		cmdArgs = append(cmdArgs, "-tags="+tg)
+	}
 	cmdArgs = append(cmdArgs, "-output=json")
 
 	raw, ferr := fetchHCPTFJSON(ctx, timeoutSec, cmdArgs...)
@@ -2372,16 +2392,16 @@ func batchUpgradeCall(ctx context.Context, args map[string]string, timeoutSec in
 	}
 
 	type queueEntry struct {
-		Workspace       string `json:"workspace"`
-		CurrentVersion  string `json:"current_version"`
-		TargetVersion   string `json:"target_version"`
-		CVECount        int    `json:"cve_count"`
-		HighestSeverity string `json:"highest_severity"`
+		Workspace       string   `json:"workspace"`
+		CurrentVersion  string   `json:"current_version"`
+		TargetVersion   string   `json:"target_version"`
+		CVECount        int      `json:"cve_count"`
+		HighestSeverity string   `json:"highest_severity"`
 		CVEIDs          []string `json:"cve_ids,omitempty"`
-		ResourceCount   int    `json:"resource_count"`
-		LastDestroys    int    `json:"last_run_destructions"`
-		RiskFlag        bool   `json:"risk_flag"`
-		Priority        int    `json:"priority"`
+		ResourceCount   int      `json:"resource_count"`
+		LastDestroys    int      `json:"last_run_destructions"`
+		RiskFlag        bool     `json:"risk_flag"`
+		Priority        int      `json:"priority"`
 	}
 
 	entries := make([]queueEntry, len(requested))
@@ -3051,22 +3071,22 @@ func complianceSummaryCall(ctx context.Context, args map[string]string, timeoutS
 	}
 
 	out := map[string]any{
-		"org":                   org,
-		"generated_at":          time.Now().UTC().Format(time.RFC3339),
-		"compliance_score":      compliancePtr,
-		"compliance_verdict":    verdict,
-		"ready_for_review":      readyForReview,
-		"total_workspaces":      totalWorkspaces,
-		"compliant_workspaces":  compliantWorkspaces,
-		"at_risk_workspaces":    atRiskWorkspaces,
-		"critical_workspaces":   criticalWorkspaces,
-		"top_cves":              topCVEs,
-		"remediation_priority":  priorityList,
+		"org":                     org,
+		"generated_at":            time.Now().UTC().Format(time.RFC3339),
+		"compliance_score":        compliancePtr,
+		"compliance_verdict":      verdict,
+		"ready_for_review":        readyForReview,
+		"total_workspaces":        totalWorkspaces,
+		"compliant_workspaces":    compliantWorkspaces,
+		"at_risk_workspaces":      atRiskWorkspaces,
+		"critical_workspaces":     criticalWorkspaces,
+		"top_cves":                topCVEs,
+		"remediation_priority":    priorityList,
 		"at_risk_workspace_names": atRiskNames,
-		"cve_data_unavailable":  auditOut.CVEDataUnavailable,
-		"provider_data_partial": providerDataPartial,
-		"provider_audits":       providerAudits,
-		"include_providers":     includeProviders,
+		"cve_data_unavailable":    auditOut.CVEDataUnavailable,
+		"provider_data_partial":   providerDataPartial,
+		"provider_audits":         providerAudits,
+		"include_providers":       includeProviders,
 	}
 	body, mErr := json.Marshal(out)
 	if mErr != nil {
@@ -6479,18 +6499,25 @@ func Definitions() []ToolDef {
 		},
 		{
 			Name:        "_hcp_tf_workspace_create",
-			Description: "Creates a new HCP Terraform workspace in an organization, optionally within a named project. Returns { workspace_id, name, org, project, execution_mode, agent_pool_id, url }. Mutating — only available when --apply is set. The caller must obtain explicit user approval before calling this tool.",
+			Description: "Creates a new HCP Terraform workspace in an organization, optionally within a named project. Supports execution mode, VCS integration, agent pools, auto-apply, tags, and cloud backend configuration. Returns { workspace_id, name, org, project, execution_mode, agent_pool_id, url }. Mutating — only available when --apply is set. The caller must obtain explicit user approval before calling this tool.",
 			InputSchema: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"org":               map[string]any{"type": "string", "description": "HCP Terraform organization name"},
-					"name":              map[string]any{"type": "string", "description": "Name of the workspace to create"},
-					"project":           map[string]any{"type": "string", "description": "Optional project name to place the workspace in. Resolved to a project_id automatically."},
-					"project_id":        map[string]any{"type": "string", "description": "Optional project ID (prj-xxx). Overrides project when both are set."},
-					"description":       map[string]any{"type": "string", "description": "Optional human description for the workspace"},
-					"terraform_version": map[string]any{"type": "string", "description": "Optional Terraform version constraint, e.g. \"~>1.0\""},
-					"execution_mode":    map[string]any{"type": "string", "enum": []string{"remote", "local", "agent"}, "description": "Optional workspace execution mode. \"remote\" (default) runs plans and applies on HCP Terraform; \"local\" only stores state and runs Terraform on the operator's machine; \"agent\" routes runs through a self-hosted agent pool and requires agent_pool_id."},
-					"agent_pool_id":     map[string]any{"type": "string", "description": "Agent pool ID (apool-xxx). Required when execution_mode is \"agent\" and forbidden otherwise."},
+					"org":                 map[string]any{"type": "string", "description": "HCP Terraform organization name"},
+					"name":                map[string]any{"type": "string", "description": "Name of the workspace to create"},
+					"project":             map[string]any{"type": "string", "description": "Optional project name to place the workspace in. Resolved to a project_id automatically."},
+					"project_id":          map[string]any{"type": "string", "description": "Optional project ID (prj-xxx). Overrides project when both are set."},
+					"description":         map[string]any{"type": "string", "description": "Optional human description for the workspace"},
+					"terraform_version":   map[string]any{"type": "string", "description": "Optional Terraform version constraint, e.g. \"~>1.0\""},
+					"execution_mode":      map[string]any{"type": "string", "enum": []string{"remote", "local", "agent"}, "description": "Optional workspace execution mode. \"remote\" (default) runs plans and applies on HCP Terraform; \"local\" only stores state and runs Terraform on the operator's machine; \"agent\" routes runs through a self-hosted agent pool and requires agent_pool_id."},
+					"agent_pool_id":       map[string]any{"type": "string", "description": "Agent pool ID (apool-xxx). Required when execution_mode is \"agent\" and forbidden otherwise."},
+					"working_directory":   map[string]any{"type": "string", "description": "Working directory for Terraform operations within the VCS repo"},
+					"auto_apply":          map[string]any{"type": "boolean", "description": "Enable auto-apply on successful plans (default: false)"},
+					"vcs_identifier":      map[string]any{"type": "string", "description": "VCS repository identifier, e.g. org/repo"},
+					"vcs_branch":          map[string]any{"type": "string", "description": "VCS branch to track (defaults to repo default branch)"},
+					"vcs_oauth_token_id":  map[string]any{"type": "string", "description": "VCS OAuth token ID (ot-xxx) for connecting to a VCS provider"},
+					"global_remote_state": map[string]any{"type": "boolean", "description": "Allow all workspaces in the org to access this workspace's state"},
+					"tags":                map[string]any{"type": "string", "description": "Comma-separated list of tags to apply to the workspace, e.g. env:prod,team:infra"},
 				},
 				"required": []string{"org", "name"},
 			},
